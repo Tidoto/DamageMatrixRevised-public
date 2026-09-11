@@ -316,11 +316,12 @@
     const dotDamage = statusDamage;
     const total = direct + (flags.total ? dotDamage : 0);
     const burstWindow = startup + duration;
-    const dps = duration > 0 ? (direct + (flags.dps ? dotDamage : 0)) / duration : null;
+    const activeDps = duration > 0 ? (direct + (flags.dps ? dotDamage : 0)) / duration : null;
     const burst = burstWindow > 0 ? (direct + (flags.burst ? dotDamage : 0)) / burstWindow : null;
     const rotationalDps = cycle > 0 ? (direct + (flags.dps ? dotDamage : 0)) / cycle : null;
+    const dps = rotationalDps;
     const dotSeconds = appliedStatuses.reduce((max, item) => Math.max(max, item.duration), 0);
-    const profile = { mode, hits: perHitValues, totalHits, direct, statuses, appliedStatuses, statusDamage, dotDamage, dotSeconds, dotPerSecond: dotSeconds > 0 ? dotDamage / dotSeconds : null, dotFlags: flags, total, dps, burst, rotationalDps, startup, duration, burstWindow, cooldownStart, cooldown, cycle };
+    const profile = { mode, hits: perHitValues, totalHits, direct, statuses, appliedStatuses, statusDamage, dotDamage, dotSeconds, dotPerSecond: dotSeconds > 0 ? dotDamage / dotSeconds : null, dotFlags: flags, total, activeDps, dps, burst, rotationalDps, startup, duration, burstWindow, cooldownStart, cooldown, cycle };
     profile.severity = severityFor(move, profile);
     return profile;
   }
