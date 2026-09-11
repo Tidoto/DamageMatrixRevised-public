@@ -87,6 +87,31 @@
     return key === "Any" || key === "Universal" || key === move.statType || normalized === canonicalSpecialKind(move.specialType) || key === move.specialCategory;
   }
 
+  // `move.specialCategory` is inconsistent in the live data: sometimes it's the special's own id
+  // ("FlameBreathing"), sometimes the champion id for a champion-exclusive kit ("Akaza" for Compass),
+  // sometimes a transformation's specialCategory ("GreatApe" for GreatApeTransform). SpecialModifiers
+  // keys can be authored against any of these, so try every candidate instead of just one.
+  function resolveSpecialModifier(boosts, move, build) {
+    const mods = boosts && boosts.SpecialModifiers;
+    if (!mods) return null;
+    const transformation = build.transformation && data.transformations && data.transformations[build.transformation];
+    const candidates = [move.specialCategory, build.special, build.transformation, transformation && transformation.specialCategory];
+    for (const key of candidates) {
+      if (key && mods[key]) return mods[key];
+    }
+    return null;
+  }
+
+  // TransformationBoosts entries are authored inconsistently too: some use a `transformationIds`
+  // map, some a singular `transformationId` string (e.g. GreatApeTransform's entry).
+  function transformationBoostMatches(entry, transformation, build) {
+    if (!transformation) return false;
+    if (entry.transformationIds && entry.transformationIds[build.transformation]) return true;
+    if (entry.transformationId && entry.transformationId === build.transformation) return true;
+    if (entry.allFullTransformations && transformation.type === "Full") return true;
+    return false;
+  }
+
   function applyFactor(multiplier, factor) {
     const value = number(factor, 1);
     if ((multiplier.mode || "multiplicative") === "additive") multiplier.additive += value - 1;
@@ -132,13 +157,12 @@
     }
     const moveMod = boosts.MoveModifiers && boosts.MoveModifiers[move.id];
     if (moveMod && typeof moveMod.damageBoost === "number") applyFactor(multiplier, 1 + moveMod.damageBoost);
-    const specialMod = boosts.SpecialModifiers && move.specialCategory && boosts.SpecialModifiers[move.specialCategory];
+    const specialMod = resolveSpecialModifier(boosts, move, build);
     if (specialMod && typeof specialMod.damageBoost === "number") applyFactor(multiplier, 1 + specialMod.damageBoost);
     if (boosts.TransformationBoost && boosts.TransformationBoost.transformationId === build.transformation && boosts.TransformationBoost.damage) addDamageBoost(multiplier, boosts.TransformationBoost.damage, move);
     (Array.isArray(boosts.TransformationBoosts) ? boosts.TransformationBoosts : []).forEach((entry) => {
       const transformation = build.transformation && data.transformations && data.transformations[build.transformation];
-      const matches = transformation && ((entry.transformationIds && entry.transformationIds[build.transformation]) || (entry.allFullTransformations && transformation.type === "Full"));
-      if (!matches) return;
+      if (!transformationBoostMatches(entry, transformation, build)) return;
       const universal = toggles.daytime && typeof entry.nightUniversalDamageMultiplier === "number" ? entry.nightUniversalDamageMultiplier : entry.universalDamageMultiplier;
       if (typeof universal === "number") applyFactor(multiplier, universal);
     });
@@ -147,6 +171,48 @@
     }
     if (boosts.InCombatStacking && toggles.inCombat && typeof boosts.InCombatStacking.damageBoostPerStack === "number") applyFactor(multiplier, 1 + number(boosts.InCombatStacking.maxStacks, 0) * boosts.InCombatStacking.damageBoostPerStack);
     if (boosts.OutOfCombatStacking && toggles.outOfCombat && typeof boosts.OutOfCombatStacking.damageBoostPerStack === "number") applyFactor(multiplier, 1 + number(boosts.OutOfCombatStacking.maxStacks, 0) * boosts.OutOfCombatStacking.damageBoostPerStack);
+    applyBestCaseCombatBoosts(multiplier, boosts, move, mode, build, toggles);
+  }
+
+  // Timed/in-combat buff families whose real uptime depends on attack sequencing or elapsed combat
+  // time this calculator doesn't simulate (attack counters, combat-entry timers, stack ramps).
+  // Per user direction: assume best case (buff always up / cycle condition always met / stacks
+  // maxed) rather than leave them out entirely. Flagged via BEST_CASE_ASSUMPTION_FAMILIES so the
+  // assumption is visible in passiveNotes(), not silent.
+  function applyBestCaseCombatBoosts(multiplier, boosts, move, mode, build, toggles) {
+    if (boosts.CombatDamageBoost && typeof boosts.CombatDamageBoost.boost === "number") applyFactor(multiplier, 1 + boosts.CombatDamageBoost.boost);
+    if (boosts.CombatEntryBuff && boosts.CombatEntryBuff.damage) addDamageBoost(multiplier, boosts.CombatEntryBuff.damage, move);
+    if (boosts.FirstAttackDamageBoost) {
+      const first = boosts.FirstAttackDamageBoost;
+      const dark = toggles.dungeon || !toggles.daytime;
+      const boost = dark && typeof first.darkBoost === "number" ? first.darkBoost : number(first.boost, 0);
+      applyFactor(multiplier, 1 + boost);
+    }
+    if (boosts.AttackCycleDamage && boostMatches(boosts.AttackCycleDamage.damageType || "Any", move) && typeof boosts.AttackCycleDamage.damageBoost === "number") applyFactor(multiplier, 1 + boosts.AttackCycleDamage.damageBoost);
+    // Only the mob/boss damage sub-effect of AttackCycleStun is modeled — the stun + ignore-defense-reduction
+    // half needs a target defense/stun-state model this calculator doesn't have (still in UNMODELED_DAMAGE_FAMILIES).
+    if (boosts.AttackCycleStun && boosts.AttackCycleStun.penetration && mode !== "duel" && typeof boosts.AttackCycleStun.penetration.mobDamageBoost === "number") applyFactor(multiplier, 1 + boosts.AttackCycleStun.penetration.mobDamageBoost);
+    if (boosts.StrengthToChakraDamageBuff && move.statType === "Chakra" && typeof boosts.StrengthToChakraDamageBuff.boost === "number") applyFactor(multiplier, 1 + boosts.StrengthToChakraDamageBuff.boost);
+    if (boosts.BossDamageStackOnHit && mode === "boss") applyFactor(multiplier, 1 + number(boosts.BossDamageStackOnHit.maxStacks, 0) * number(boosts.BossDamageStackOnHit.boostPerStack, 0));
+    if (boosts.CombatStatGainMultiplier) {
+      Object.entries(boosts.CombatStatGainMultiplier).forEach(([key, config]) => {
+        if (config && boostMatches(key, move)) applyFactor(multiplier, 1 + number(config.maxStacks, 0) * number(config.boostPerStack, 0));
+      });
+    }
+    if (boosts.CriticalHit) {
+      const crit = boosts.CriticalHit;
+      const matchesType = !crit.damageTypes || Object.keys(crit.damageTypes).some((key) => boostMatches(key, move));
+      const specialIds = crit.specialIds;
+      const hasSpecialRestriction = specialIds && !Array.isArray(specialIds) && Object.keys(specialIds).length > 0;
+      const matchesSpecial = !hasSpecialRestriction || (build.special && specialIds[build.special]);
+      if (matchesType && matchesSpecial) {
+        // Best case: assume the after-combatReadDuration chance ramp and any low-health crit-damage ramp are already maxed.
+        const chance = Math.min(1, number(crit.chance, 0) + number(crit.combatChanceBonus, 0));
+        const critMultiplier = number(crit.multiplier, 1) + number(crit.lowHealthMaxBonus, 0);
+        // Expected-value approximation: chance x bonus, same convention already used for DamageProc.
+        applyFactor(multiplier, 1 + chance * Math.max(0, critMultiplier - 1));
+      }
+    }
   }
 
   // Cooldown-side counterpart to applyGenericDamageBoosts: flat/keyed CDR, health-gated CDR (with
@@ -174,10 +240,11 @@
       }
       const missing = boosts.MissingHealthCooldownReduction;
       if (missing) {
-        const steps = Math.floor((1 - healthPercent) / Math.max(number(missing.stepFraction, 0.1), 0.001));
+        // Small epsilon guards against float division (e.g. 0.6/0.1 === 5.999...999) undercounting a step.
+        const steps = Math.floor((1 - healthPercent) / Math.max(number(missing.stepFraction, 0.1), 0.001) + 1e-9);
         fractions.push(Math.min(number(missing.maxReduction, 0), Math.max(0, steps) * number(missing.reductionPerStep, 0)));
       }
-      const specialMod = boosts.SpecialModifiers && move.specialCategory && boosts.SpecialModifiers[move.specialCategory];
+      const specialMod = resolveSpecialModifier(boosts, move, build);
       if (specialMod && typeof specialMod.cooldownReduction === "number") fractions.push(specialMod.cooldownReduction);
       const moveMod = boosts.MoveModifiers && boosts.MoveModifiers[move.id];
       if (moveMod && typeof moveMod.cooldownMultiplier === "number") directMultiplier *= moveMod.cooldownMultiplier;
@@ -192,33 +259,51 @@
   // (party composition, attack-sequence counters, combat-entry timers, target-side debuffs, ...).
   // Flagged instead of silently ignored so a champion's numbers aren't mistaken for "fully applied".
   const UNMODELED_DAMAGE_FAMILIES = {
-    CombatDamageBoost: "grants a timed damage buff on entering combat",
-    CombatEntryBuff: "grants a timed damage buff on entering combat",
-    FirstAttackDamageBoost: "boosts only the first attack after a cooldown",
-    AttackCycleDamage: "boosts every Nth attack in a row",
-    AttackCycleStun: "penetrates defense every Nth attack in a row",
+    AttackCycleStun: "the stun + ignore-defense-reduction half needs target defense/stun tracking, which isn't modeled (its mob/boss bonus-damage half is modeled, see best-case notes)",
     PartyDamageAura: "requires party composition, which isn't modeled",
     PartyBuffAura: "requires party composition, which isn't modeled",
     PartyLivingAura: "requires party composition, which isn't modeled",
-    StrengthToChakraDamageBuff: "converts one stat's usage into a temporary buff for another",
-    BossDamageStackOnHit: "requires tracking consecutive hits on the same target",
     Hypnosis: "applies a debuff to the target rather than a buff to the attacker",
     BurnDamageMultiplier: "scales Burn/DoT ticks, which aren't tracked per boost source",
     BurnOnHit: "applies a DoT with target-side conditions",
     OnHitVulnerability: "applies a stacking debuff to the target",
-    CombatStatGainMultiplier: "requires a simulated in-combat timer",
+  };
+
+  // Families applied by applyBestCaseCombatBoosts() at an optimistic "always up / max stacks" value
+  // rather than left out, because their real uptime depends on attack sequencing or elapsed combat
+  // time this calculator doesn't simulate. Surfaced here so that optimism is visible, not silent.
+  const BEST_CASE_ASSUMPTION_FAMILIES = {
+    CombatDamageBoost: "assumes its timed on-combat-entry damage buff is always up",
+    CombatEntryBuff: "assumes its timed on-combat-entry damage buff is always up",
+    FirstAttackDamageBoost: "assumes every attack qualifies as the buffed \"first attack\"",
+    AttackCycleDamage: "assumes the every-Nth-attack condition is always met",
+    AttackCycleStun: "assumes its mob/boss bonus-damage condition is always met",
+    StrengthToChakraDamageBuff: "assumes the Strength-triggered Chakra buff is always active",
+    BossDamageStackOnHit: "assumes max consecutive-hit stacks are already built up",
+    CombatStatGainMultiplier: "assumes max in-combat stacks are already built up",
+    CriticalHit: "assumes the in-combat crit-chance ramp and any low-health crit-damage ramp are already maxed",
   };
 
   function collectUnmodeledNotes(name, boosts) {
     return Object.keys(boosts || {}).filter((key) => UNMODELED_DAMAGE_FAMILIES[key]).map((key) => `${name} has ${key} (${UNMODELED_DAMAGE_FAMILIES[key]}) \u2014 not reflected in the damage numbers.`);
   }
 
+  function collectBestCaseNotes(name, boosts) {
+    return Object.keys(boosts || {}).filter((key) => BEST_CASE_ASSUMPTION_FAMILIES[key]).map((key) => `${name} has ${key} (${BEST_CASE_ASSUMPTION_FAMILIES[key]}) \u2014 modeled at best case, actual numbers may be lower.`);
+  }
+
   function passiveNotes(build) {
     const notes = [];
     const champion = build.champion && data.champions && data.champions[build.champion];
-    if (champion) notes.push(...collectUnmodeledNotes(champion.displayName || champion.id, champion.Boosts));
+    if (champion) {
+      notes.push(...collectUnmodeledNotes(champion.displayName || champion.id, champion.Boosts));
+      notes.push(...collectBestCaseNotes(champion.displayName || champion.id, champion.Boosts));
+    }
     const accessories = (Array.isArray(build.accessories) ? build.accessories : [build.accessory]).map((id) => id && data.accessories && data.accessories[id]).filter(Boolean);
-    accessories.forEach((accessory) => notes.push(...collectUnmodeledNotes(accessory.displayName || accessory.id, accessory.Boosts)));
+    accessories.forEach((accessory) => {
+      notes.push(...collectUnmodeledNotes(accessory.displayName || accessory.id, accessory.Boosts));
+      notes.push(...collectBestCaseNotes(accessory.displayName || accessory.id, accessory.Boosts));
+    });
     return notes;
   }
 
@@ -376,7 +461,7 @@
       if (boosts.LowHealthDefense && hp <= number(boosts.LowHealthDefense.threshold, 0)) addReduction(`${name} · Low-health defense`, boosts.LowHealthDefense.reduction);
       if (boosts.AttackerMissingHealthDefense) {
         const config = boosts.AttackerMissingHealthDefense;
-        const steps = Math.floor(missing / Math.max(number(config.stepFraction, 0.1), 0.001));
+        const steps = Math.floor(missing / Math.max(number(config.stepFraction, 0.1), 0.001) + 1e-9);
         addReduction(`${name} · Missing-health defense`, Math.min(number(config.maxReduction, 0), steps * number(config.reductionPerStep, 0)));
       }
       if (boosts.DungeonDefense && toggles.dungeon) addReduction(`${name} · Dungeon defense`, boosts.DungeonDefense);
@@ -397,8 +482,7 @@
         addReduction(`${name} · ${build.transformation} defense`, boosts.TransformationBoost.damageReduction);
       }
       (Array.isArray(boosts.TransformationBoosts) ? boosts.TransformationBoosts : []).forEach((entry) => {
-        const matches = transformation && ((entry.transformationIds && entry.transformationIds[build.transformation]) || (entry.allFullTransformations && transformation.type === "Full"));
-        if (!matches) return;
+        if (!transformationBoostMatches(entry, transformation, build)) return;
         addReduction(`${name} · Transformation defense`, entry.damageReduction);
         const stacking = entry.stacking || {};
         addReduction(`${name} · Transformation stacks`, number(stacking.maxStacks, 0) * number(stacking.damageReductionPerStack, 0), true);
