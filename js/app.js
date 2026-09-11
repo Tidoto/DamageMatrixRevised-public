@@ -980,6 +980,11 @@
     state.sim.result = { build: builds[0]?.build || build, best: builds[0]?.best || best, builds, settings, attackCount: attacks.length, pinned };
   }
 
+  function passiveNotesMarkup(build) {
+    const notes = engine.passiveNotes(build);
+    return notes.length ? `<div class="passive-notes"><small>${notes.map((line) => escapeHtml(line)).join("<br>")}</small></div>` : "";
+  }
+
   function buildSlotBreakdown(field, id, mode) {
     const isolated = applyBuildSlot({ healthPercent: state.build.healthPercent, maxHealth: state.build.maxHealth, scalingMode: state.build.scalingMode, special: field === "special" ? "" : state.build.special }, field, id);
     const defense = engine.defenseProfile({ build: isolated, mode: engineMode(mode), defense: state.defense });
@@ -990,7 +995,7 @@
       ["Healing", `${format(defense.healPerSecond)} hp/s`],
       ["Heal beats tankiness below", `${format(defense.healBreakeven)} incoming dps`],
     ].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join("");
-    const contributions = [...defense.sources.health.map((item) => `Health +${format(item.fraction * 100)}% \u2014 ${item.label}`), ...defense.sources.reduction.map((item) => `Reduction ${format(item.fraction * 100)}% \u2014 ${item.label}${item.sustainedOnly ? " (uptime averaged)" : ""}`), ...defense.sources.healing.map((item) => `Heal ${format(item.rate * 100)}%/s \u2014 ${item.label}`), ...defense.sources.notes];
+    const contributions = [...defense.sources.health.map((item) => `Health +${format(item.fraction * 100)}% \u2014 ${item.label}`), ...defense.sources.reduction.map((item) => `Reduction ${format(item.fraction * 100)}% \u2014 ${item.label}${item.sustainedOnly ? " (uptime averaged)" : ""}`), ...defense.sources.healing.map((item) => `Heal ${format(item.rate * 100)}%/s \u2014 ${item.label}`), ...defense.sources.notes, ...engine.passiveNotes(isolated)];
     return { damage, rows, contributions };
   }
 
@@ -1016,14 +1021,28 @@
 
   function buildCatalogMarkup() {
     const query = state.builds.search.trim().toLowerCase();
+    const rarityOrder = ["Sovereign", "Exclusive", "Mythic", "Secret", "Legendary", "Epic", "Rare", "Uncommon", "Common"];
+    const rarityKey = (rarity) => {
+      const normalized = String(rarity || "").trim().toLowerCase();
+      return rarityOrder.find((name) => name.toLowerCase() === normalized) || "Other";
+    };
+    const itemMarkup = (slot, record, rarity) => {
+      const checked = state.build[slot.field] === record.id;
+      const active = state.builds.selected && state.builds.selected.field === slot.field && state.builds.selected.id === record.id;
+      const rarityClass = rarity ? ` rarity-${rarity.toLowerCase()}` : "";
+      const note = slot.field === "champion" ? "" : `<small>${slot.note(record) || ""}</small>`;
+      return `<div class="build-item${rarityClass}${active ? " active" : ""}"><label class="build-check"><input type="checkbox" data-toggle-slot="${slot.field}" data-toggle-id="${record.id}"${checked ? " checked" : ""}></label><button type="button" data-open-item="${slot.field}" data-open-id="${record.id}">${iconNode(slot.icon(record), slot.label(record))}<span>${slot.label(record)}</span>${note}</button></div>`;
+    };
     return BUILD_SLOTS.map((slot) => {
       const records = Object.values(slot.records() || {}).filter((record) => !query || `${slot.label(record)} ${record.id} ${slot.note(record) || ""}`.toLowerCase().includes(query)).sort((a, b) => slot.label(a).localeCompare(slot.label(b)));
       const open = state.builds.openGroups.has(slot.group) || query.length > 0;
-      const items = records.map((record) => {
-        const checked = state.build[slot.field] === record.id;
-        const active = state.builds.selected && state.builds.selected.field === slot.field && state.builds.selected.id === record.id;
-        return `<div class="build-item${active ? " active" : ""}"><label class="build-check"><input type="checkbox" data-toggle-slot="${slot.field}" data-toggle-id="${record.id}"${checked ? " checked" : ""}></label><button type="button" data-open-item="${slot.field}" data-open-id="${record.id}">${iconNode(slot.icon(record), slot.label(record))}<span>${slot.label(record)}</span><small>${slot.note(record) || ""}</small></button></div>`;
-      }).join("");
+      const items = slot.field === "champion" ? rarityOrder.concat("Other").map((rarity) => {
+        const rarityRecords = records.filter((record) => rarityKey(record.rarity) === rarity);
+        if (!rarityRecords.length) return "";
+        const groupId = `${slot.group}/${rarity}`;
+        const groupOpen = state.builds.openGroups.has(groupId) || query.length > 0;
+        return `<details class="champion-rarity rarity-${rarity.toLowerCase()}" data-build-group="${groupId}"${groupOpen ? " open" : ""}><summary>${rarity} (${rarityRecords.length})</summary>${rarityRecords.map((record) => itemMarkup(slot, record, rarity)).join("")}</details>`;
+      }).join("") : records.map((record) => itemMarkup(slot, record)).join("");
       return `<details data-build-group="${slot.group}"${open ? " open" : ""}><summary>${slot.group} (${records.length})</summary>${items || '<span class="build-search-empty">No matches</span>'}</details>`;
     }).join("");
   }
@@ -1198,7 +1217,7 @@
     const view = $("#view-builds");
     const mode = state.matrix.mode;
     const defense = engine.defenseProfile({ build: state.build, mode: engineMode(mode), defense: state.defense });
-    view.innerHTML = `<div class="builds-layout${state.builds.matrixOpen ? " drawer-open" : ""}${state.builds.catalogOpen ? "" : " catalog-collapsed"}"><aside class="builds-catalog">${state.builds.catalogOpen ? `<div class="catalog-content"><div class="catalog-heading"><div><span class="eyebrow">BUFF INDEX</span><h1>Builds</h1></div></div><label class="search-wrap"><span aria-hidden="true">\u2315</span><input data-builds-search type="search" value="${state.builds.search}" placeholder="Search champions, gears, titles"></label><div class="builds-tree">${buildCatalogMarkup()}</div></div>` : ""}<button type="button" class="drawer-toggle catalog-toggle" data-toggle-catalog aria-expanded="${state.builds.catalogOpen}" title="Buff index"><span>${state.builds.catalogOpen ? "\u2039" : "\u203a"}</span><small>INDEX</small></button></aside><div class="builds-main">${buildLibraryMarkup()}<section class="build-bar"><div class="build-bar-head"><span class="eyebrow">CURRENT BUILD</span><label class="matrix-check">Mode<select data-builds-mode><option value="pve">PvE</option><option value="pvp">PvP</option><option value="boss">Boss</option></select></label><label class="matrix-check">Reduction stacking<select data-defense-stacking><option value="multiplicative">Multiplicative</option><option value="additive">Additive</option></select></label><label class="matrix-check">Sustain window<input data-defense-window type="number" min="1" step="1" value="${state.defense.window}"></label></div><div class="build-chips">${buildBarMarkup()}</div><div class="build-summary"><div><span>Max health</span><strong>${format(defense.maxHealth)}</strong></div><div><span>Damage taken</span><strong>${format(defense.burstTaken * 100)}%</strong></div><div><span>Effective HP</span><strong>${format(defense.effectiveHealth)}</strong></div><div><span>Healing</span><strong>${format(defense.healPerSecond)} hp/s</strong></div><div><span>Survivable DPS</span><strong>${format(defense.sustainableDps)}</strong></div><div><span>Heal beats tankiness below</span><strong>${format(defense.healBreakeven)} dps</strong></div></div></section><section class="build-rotation"><div class="build-bar-head"><span class="eyebrow">ROTATION</span><small>Tick attacks in the matrix. Specials can be mixed freely, but only one per type and none that has a transformation.</small><button type="button" data-clear-rotation>Clear</button></div>${rotationMarkup()}</section>${renderBuildDetail(mode)}</div><aside class="matrix-drawer"><button type="button" class="drawer-toggle" data-toggle-drawer aria-expanded="${state.builds.matrixOpen}" title="Damage matrix with applied buffs"><span>${state.builds.matrixOpen ? "\u203a" : "\u2039"}</span><small>MATRIX</small></button>${drawerMatrixMarkup()}</aside></div>`;
+    view.innerHTML = `<div class="builds-layout${state.builds.matrixOpen ? " drawer-open" : ""}${state.builds.catalogOpen ? "" : " catalog-collapsed"}"><aside class="builds-catalog">${state.builds.catalogOpen ? `<div class="catalog-content"><div class="catalog-heading"><div><span class="eyebrow">BUFF INDEX</span><h1>Builds</h1></div></div><label class="search-wrap"><span aria-hidden="true">\u2315</span><input data-builds-search type="search" value="${state.builds.search}" placeholder="Search champions, gears, titles"></label><div class="builds-tree">${buildCatalogMarkup()}</div></div>` : ""}<button type="button" class="drawer-toggle catalog-toggle" data-toggle-catalog aria-expanded="${state.builds.catalogOpen}" title="Buff index"><span>${state.builds.catalogOpen ? "\u2039" : "\u203a"}</span><small>INDEX</small></button></aside><div class="builds-main">${buildLibraryMarkup()}<section class="build-bar"><div class="build-bar-head"><span class="eyebrow">CURRENT BUILD</span><label class="matrix-check">Mode<select data-builds-mode><option value="pve">PvE</option><option value="pvp">PvP</option><option value="boss">Boss</option></select></label><label class="matrix-check">Reduction stacking<select data-defense-stacking><option value="multiplicative">Multiplicative</option><option value="additive">Additive</option></select></label><label class="matrix-check">Sustain window<input data-defense-window type="number" min="1" step="1" value="${state.defense.window}"></label><label class="matrix-check"><input data-defense-toggle="inCombat" type="checkbox"${state.defense.inCombat ? " checked" : ""}> In combat</label><label class="matrix-check"><input data-defense-toggle="outOfCombat" type="checkbox"${state.defense.outOfCombat ? " checked" : ""}> Out of combat</label><label class="matrix-check"><input data-defense-toggle="daytime" type="checkbox"${state.defense.daytime ? " checked" : ""}> Daytime</label><label class="matrix-check"><input data-defense-toggle="dungeon" type="checkbox"${state.defense.dungeon ? " checked" : ""}> In dungeon</label></div><div class="build-chips">${buildBarMarkup()}</div><div class="build-summary"><div><span>Max health</span><strong>${format(defense.maxHealth)}</strong></div><div><span>Damage taken</span><strong>${format(defense.burstTaken * 100)}%</strong></div><div><span>Effective HP</span><strong>${format(defense.effectiveHealth)}</strong></div><div><span>Healing</span><strong>${format(defense.healPerSecond)} hp/s</strong></div><div><span>Survivable DPS</span><strong>${format(defense.sustainableDps)}</strong></div><div><span>Heal beats tankiness below</span><strong>${format(defense.healBreakeven)} dps</strong></div></div>${passiveNotesMarkup(state.build)}</section><section class="build-rotation"><div class="build-bar-head"><span class="eyebrow">ROTATION</span><small>Tick attacks in the matrix. Specials can be mixed freely, but only one per type and none that has a transformation.</small><button type="button" data-clear-rotation>Clear</button></div>${rotationMarkup()}</section>${renderBuildDetail(mode)}</div><aside class="matrix-drawer"><button type="button" class="drawer-toggle" data-toggle-drawer aria-expanded="${state.builds.matrixOpen}" title="Damage matrix with applied buffs"><span>${state.builds.matrixOpen ? "\u203a" : "\u2039"}</span><small>MATRIX</small></button>${drawerMatrixMarkup()}</aside></div>`;
     view.querySelector("[data-builds-mode]").value = mode;
     view.querySelector("[data-defense-stacking]").value = state.defense.stacking;
     const buildsSearchInput = view.querySelector("[data-builds-search]");
@@ -1210,6 +1229,7 @@
     view.querySelector("[data-builds-mode]").onchange = (event) => { state.matrix.mode = event.target.value; renderBuilds(); };
     view.querySelector("[data-defense-stacking]").onchange = (event) => { state.defense.stacking = event.target.value; renderBuilds(); };
     view.querySelector("[data-defense-window]").onchange = (event) => { state.defense.window = Math.max(1, Number(event.target.value) || 10); renderBuilds(); };
+    view.querySelectorAll("[data-defense-toggle]").forEach((box) => box.onchange = (event) => { state.defense[box.dataset.defenseToggle] = event.target.checked; renderBuilds(); });
     view.querySelector("[data-toggle-drawer]").onclick = () => { state.builds.matrixOpen = !state.builds.matrixOpen; renderBuilds(); };
     view.querySelector("[data-toggle-catalog]").onclick = () => { state.builds.catalogOpen = !state.builds.catalogOpen; renderBuilds(); };
     bindBuildLibrary(view, renderBuilds, () => state.build);
@@ -1446,6 +1466,11 @@
     restoreFocus(focus);
   }
 
+  function renderDetails() {
+    const view = $("#view-details");
+    view.innerHTML = `<header class="matrix-header"><div><span class="eyebrow">REFERENCE</span><h2>How calculations work</h2></div></header><div class="details-guide"><section><h3>Starting damage</h3><p>Each move has one or more hits. The calculator finds the base damage for the chosen target mode, multiplies it by each hit's damage multiplier, then multiplies by that hit's count. Adding those hit totals gives direct damage.</p><p>Boss mode starts from the move's BossDMG value. PvP starts from PlayerDMG. PvE starts from your stat value, your stat limit, and the move's PvE multiplier.</p></section><section><h3>Build buffs</h3><p>Your champion, trait, title, gear, and transformation can add damage for a matching stat, special, or target mode. In Multiplicative mode, each matching buff multiplies the running value. In Additive mode, the bonus portions are added together before they are applied.</p><p>For example, two +20% matching buffs become 1.2 x 1.2 = 1.44 in Multiplicative mode, or 1 + 0.2 + 0.2 = 1.4 in Additive mode.</p></section><section><h3>Damage over time</h3><p>A status effect with DoT is calculated separately after direct damage. Its tick damage uses its listed basis, applies the same build multiplier, then multiplies by its number of ticks. It only applies when the status can affect the selected target mode.</p><p>The three DoT checkboxes on an attack decide where that value is included: Total Damage, DPS and Rotational DPS, and Burst. By default it counts in total damage and DPS, but not burst.</p></section><section><h3>Timing and rate metrics</h3><p>DPS divides damage by the move duration. Burst divides damage by startup plus duration, representing how quickly its damage first resolves. Rotational DPS divides damage by the full cycle, which is cooldown start plus base cooldown.</p><p>For a chosen rotation, attacks are scheduled one after another using their endlag. Chain burst uses the time until the final hit lands. The repeating rotation uses the longer of the chained endlag and its slowest cooldown cycle.</p></section><section><h3>Defense and survivability</h3><p>Health bonuses raise maximum health. Damage reduction lowers incoming damage using either multiplicative or additive stacking, selected in Builds. Effective HP is maximum health divided by the damage taken fraction.</p><p>Survivable DPS uses the chosen sustain window, your effective health, and any continuous healing. It estimates the incoming DPS that would empty the health pool exactly at the end of that window.</p></section><section><h3>Severity and rebalance</h3><p>Severity is a 0 to 9 estimate based on burst damage, largest hitbox size, duration, and endlag. A move can override that result with a manual tier.</p><p>Rebalance takes the first selected move as the baseline. It adjusts the other moves toward the same chosen metric by changing damage first, then tick count or timing controls that are not locked.</p></section></div>`;
+  }
+
   function renderAttack() {
     const view = $("#view-attacks");
     if (!state.selected) { view.innerHTML = '<div class="empty-view"><h2>Choose a move.</h2></div>'; return; }
@@ -1504,7 +1529,7 @@
     if (deleteButton) deleteButton.onclick = () => { delete engine.customData.powers[state.selected.powerId]; Object.values(engine.customData.specials).forEach((special) => { special.abilities = (special.abilities || []).filter((ability) => ability.powerId !== state.selected.powerId); }); data.powers = engine.allPowers(); data.specials = engine.allSpecials(); refreshEntries(); state.selected = null; localStorage.setItem("damage-matrix-customs", JSON.stringify(engine.customData)); renderCatalog(); renderAttack(); };
   }
 
-  document.querySelectorAll(".nav-item").forEach((item) => item.onclick = () => { state.activeView = item.dataset.view; document.querySelectorAll(".nav-item").forEach((nav) => nav.classList.toggle("active", nav === item)); document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${item.dataset.view}`)); $("#app").classList.toggle("matrix-mode", state.activeView !== "attacks"); if (state.activeView === "matrix") renderMatrix(); if (state.activeView === "builds") renderBuilds(); if (state.activeView === "simulation") renderSimulation(); if (state.activeView === "rebalance") renderRebalance(); });
+  document.querySelectorAll(".nav-item").forEach((item) => item.onclick = () => { state.activeView = item.dataset.view; document.querySelectorAll(".nav-item").forEach((nav) => nav.classList.toggle("active", nav === item)); document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${item.dataset.view}`)); $("#app").classList.toggle("matrix-mode", state.activeView !== "attacks"); if (state.activeView === "matrix") renderMatrix(); if (state.activeView === "builds") renderBuilds(); if (state.activeView === "simulation") renderSimulation(); if (state.activeView === "rebalance") renderRebalance(); if (state.activeView === "details") renderDetails(); });
   $("#search").oninput = (event) => { state.search = event.target.value; renderCatalog(); };
   $("#hide-utility").onchange = renderCatalog;
   $("#theme-toggle").onclick = () => { state.theme = state.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = state.theme; localStorage.setItem("damage-matrix-theme", state.theme); };
@@ -1515,5 +1540,5 @@
   document.documentElement.dataset.theme = state.theme;
   $("#data-status").textContent = data.generatedAt ? `Synced ${new Date(data.generatedAt).toLocaleDateString()}` : "Data unavailable";
   state.selected = entries.find((entry) => entry.powerId === "JudgementCut") || entries[0] || null;
-  renderCatalog(); renderAttack(); renderMatrix(); renderBuilds(); renderSimulation();
+  renderCatalog(); renderAttack(); renderMatrix(); renderBuilds(); renderSimulation(); renderDetails();
 })();

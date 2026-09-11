@@ -118,8 +118,113 @@
     });
   }
 
+  // Boosts families that follow the same {stat/specialType: fraction} or id-keyed shape as the
+  // hand-written cases above, so one generic reader can apply all of them instead of one branch per champion.
+  function applyGenericDamageBoosts(multiplier, boosts, move, mode, build, toggles) {
+    if (!boosts) return;
+    if (boosts.MobDamage && mode !== "duel") addDamageBoost(multiplier, boosts.MobDamage, move);
+    if (boosts.DamageProc) {
+      const proc = boosts.DamageProc;
+      const matchesType = !proc.damageType || boostMatches(proc.damageType, move);
+      const matchesSpecial = !proc.requiredSpecialId || proc.requiredSpecialId === build.special;
+      // Expected-value approximation: chance x bonus, same convention already used for defensive procs.
+      if (matchesType && matchesSpecial) applyFactor(multiplier, 1 + number(proc.chance, 0) * number(proc.damageBoost, 0));
+    }
+    const moveMod = boosts.MoveModifiers && boosts.MoveModifiers[move.id];
+    if (moveMod && typeof moveMod.damageBoost === "number") applyFactor(multiplier, 1 + moveMod.damageBoost);
+    const specialMod = boosts.SpecialModifiers && move.specialCategory && boosts.SpecialModifiers[move.specialCategory];
+    if (specialMod && typeof specialMod.damageBoost === "number") applyFactor(multiplier, 1 + specialMod.damageBoost);
+    if (boosts.TransformationBoost && boosts.TransformationBoost.transformationId === build.transformation && boosts.TransformationBoost.damage) addDamageBoost(multiplier, boosts.TransformationBoost.damage, move);
+    (Array.isArray(boosts.TransformationBoosts) ? boosts.TransformationBoosts : []).forEach((entry) => {
+      const transformation = build.transformation && data.transformations && data.transformations[build.transformation];
+      const matches = transformation && ((entry.transformationIds && entry.transformationIds[build.transformation]) || (entry.allFullTransformations && transformation.type === "Full"));
+      if (!matches) return;
+      const universal = toggles.daytime && typeof entry.nightUniversalDamageMultiplier === "number" ? entry.nightUniversalDamageMultiplier : entry.universalDamageMultiplier;
+      if (typeof universal === "number") applyFactor(multiplier, universal);
+    });
+    if (boosts.DaytimeBoost && toggles.daytime && boosts.DaytimeBoost.damageTypes && typeof boosts.DaytimeBoost.damageBoost === "number") {
+      Object.keys(boosts.DaytimeBoost.damageTypes).forEach((key) => { if (boostMatches(key, move)) applyFactor(multiplier, 1 + boosts.DaytimeBoost.damageBoost); });
+    }
+    if (boosts.InCombatStacking && toggles.inCombat && typeof boosts.InCombatStacking.damageBoostPerStack === "number") applyFactor(multiplier, 1 + number(boosts.InCombatStacking.maxStacks, 0) * boosts.InCombatStacking.damageBoostPerStack);
+    if (boosts.OutOfCombatStacking && toggles.outOfCombat && typeof boosts.OutOfCombatStacking.damageBoostPerStack === "number") applyFactor(multiplier, 1 + number(boosts.OutOfCombatStacking.maxStacks, 0) * boosts.OutOfCombatStacking.damageBoostPerStack);
+  }
+
+  // Cooldown-side counterpart to applyGenericDamageBoosts: flat/keyed CDR, health-gated CDR (with
+  // optional replacesBase override), and per-move/per-special cooldown multipliers.
+  function cooldownScale(move, build, healthPercent) {
+    const champion = build.champion && data.champions && data.champions[build.champion];
+    const accessories = (Array.isArray(build.accessories) ? build.accessories : [build.accessory]).map((id) => id && data.accessories && data.accessories[id]).filter(Boolean);
+    const fractions = [];
+    let directMultiplier = 1;
+    const addSource = (boosts) => {
+      if (!boosts) return;
+      const low = boosts.LowHealthCooldownReduction;
+      const lowActive = low && healthPercent <= number(low.threshold, 0) && boostMatches(low.damageType || "Any", move);
+      const base = boosts.CooldownReduction;
+      const baseMap = typeof base === "number" ? { Any: base } : base;
+      Object.entries(baseMap || {}).forEach(([key, value]) => {
+        if (!boostMatches(key, move)) return;
+        if (lowActive && low.replacesBase) return; // superseded by the health-gated rate below
+        fractions.push(number(value, 0));
+      });
+      if (lowActive) fractions.push(number(low.reduction, 0));
+      const berserker = boosts.LowHealthBerserker;
+      if (berserker && berserker.cooldownReduction && healthPercent <= number(berserker.threshold, 0)) {
+        Object.entries(berserker.cooldownReduction).forEach(([key, value]) => { if (boostMatches(key, move)) fractions.push(number(value, 0)); });
+      }
+      const missing = boosts.MissingHealthCooldownReduction;
+      if (missing) {
+        const steps = Math.floor((1 - healthPercent) / Math.max(number(missing.stepFraction, 0.1), 0.001));
+        fractions.push(Math.min(number(missing.maxReduction, 0), Math.max(0, steps) * number(missing.reductionPerStep, 0)));
+      }
+      const specialMod = boosts.SpecialModifiers && move.specialCategory && boosts.SpecialModifiers[move.specialCategory];
+      if (specialMod && typeof specialMod.cooldownReduction === "number") fractions.push(specialMod.cooldownReduction);
+      const moveMod = boosts.MoveModifiers && boosts.MoveModifiers[move.id];
+      if (moveMod && typeof moveMod.cooldownMultiplier === "number") directMultiplier *= moveMod.cooldownMultiplier;
+    };
+    addSource(champion && champion.Boosts);
+    accessories.forEach((accessory) => addSource(accessory.Boosts));
+    const combined = Math.max(0.05, fractions.reduce((product, fraction) => product * (1 - fraction), 1));
+    return combined * directMultiplier;
+  }
+
+  // Boosts families that show up in the live data but need state this calculator doesn't model
+  // (party composition, attack-sequence counters, combat-entry timers, target-side debuffs, ...).
+  // Flagged instead of silently ignored so a champion's numbers aren't mistaken for "fully applied".
+  const UNMODELED_DAMAGE_FAMILIES = {
+    CombatDamageBoost: "grants a timed damage buff on entering combat",
+    CombatEntryBuff: "grants a timed damage buff on entering combat",
+    FirstAttackDamageBoost: "boosts only the first attack after a cooldown",
+    AttackCycleDamage: "boosts every Nth attack in a row",
+    AttackCycleStun: "penetrates defense every Nth attack in a row",
+    PartyDamageAura: "requires party composition, which isn't modeled",
+    PartyBuffAura: "requires party composition, which isn't modeled",
+    PartyLivingAura: "requires party composition, which isn't modeled",
+    StrengthToChakraDamageBuff: "converts one stat's usage into a temporary buff for another",
+    BossDamageStackOnHit: "requires tracking consecutive hits on the same target",
+    Hypnosis: "applies a debuff to the target rather than a buff to the attacker",
+    BurnDamageMultiplier: "scales Burn/DoT ticks, which aren't tracked per boost source",
+    BurnOnHit: "applies a DoT with target-side conditions",
+    OnHitVulnerability: "applies a stacking debuff to the target",
+    CombatStatGainMultiplier: "requires a simulated in-combat timer",
+  };
+
+  function collectUnmodeledNotes(name, boosts) {
+    return Object.keys(boosts || {}).filter((key) => UNMODELED_DAMAGE_FAMILIES[key]).map((key) => `${name} has ${key} (${UNMODELED_DAMAGE_FAMILIES[key]}) \u2014 not reflected in the damage numbers.`);
+  }
+
+  function passiveNotes(build) {
+    const notes = [];
+    const champion = build.champion && data.champions && data.champions[build.champion];
+    if (champion) notes.push(...collectUnmodeledNotes(champion.displayName || champion.id, champion.Boosts));
+    const accessories = (Array.isArray(build.accessories) ? build.accessories : [build.accessory]).map((id) => id && data.accessories && data.accessories[id]).filter(Boolean);
+    accessories.forEach((accessory) => notes.push(...collectUnmodeledNotes(accessory.displayName || accessory.id, accessory.Boosts)));
+    return notes;
+  }
+
   function buildMultiplier(move, mode, options) {
     const build = options && options.build || {};
+    const toggles = Object.assign({ inCombat: true, outOfCombat: false, daytime: false, dungeon: false }, options && options.defense);
     const multiplier = { value: 1, additive: 0, mode: build.scalingMode || "multiplicative" };
     const champion = build.champion && data.champions && data.champions[build.champion];
     const trait = build.trait && data.traits && data.traits[build.trait];
@@ -132,6 +237,7 @@
     if (lowHealth && healthPercent <= number(lowHealth.threshold, 0) && (!lowHealth.damageTypes || lowHealth.damageTypes[move.statType] || lowHealth.damageTypes[canonicalSpecialKind(move.specialType)])) applyFactor(multiplier, 1 + number(lowHealth.boost, 0));
     const berserker = champion && champion.Boosts && champion.Boosts.LowHealthBerserker;
     if (berserker && healthPercent <= number(berserker.threshold, 0) && (!berserker.damageTypes || berserker.damageTypes[move.statType] || berserker.damageTypes[canonicalSpecialKind(move.specialType)])) applyFactor(multiplier, 1 + number(berserker.damageBoost, 0));
+    applyGenericDamageBoosts(multiplier, champion && champion.Boosts, move, mode, build, toggles);
     (trait && trait.tiers && trait.tiers[Number(build.traitTier || 0)] && trait.tiers[Number(build.traitTier || 0)].effects || []).forEach((effect) => {
       if (effect.category === "DamageBoost") applyFactor(multiplier, 1 + number(effect.modifier, 0));
     });
@@ -144,6 +250,7 @@
       if (boosts.SpecialDamage && move.specialCategory) applyFactor(multiplier, 1 + number(boosts.SpecialDamage[move.specialCategory], 0));
       if (mode === "boss") applyFactor(multiplier, 1 + number(boosts.BossDamage, 0));
       if (mode === "duel") applyFactor(multiplier, 1 + number(boosts.PvpDamage, 0));
+      applyGenericDamageBoosts(multiplier, boosts, move, mode, build, toggles);
     });
     applyTransformationBoost(multiplier, transformation, move);
     return multiplierValue(multiplier);
@@ -201,7 +308,9 @@
     const startup = number(runtime.activationTillFirstHitbox, 0);
     const duration = number(runtime.durationSeconds, 0);
     const cooldownStart = number(runtime.activationTillCooldownStart, number(runtime.activationTillEndlagEnd, 0));
-    const cooldown = number(move.baseCooldown, 0);
+    const build = options && options.build || {};
+    const healthPercent = Math.max(0, Math.min(100, number(build.healthPercent, 100))) / 100;
+    const cooldown = number(move.baseCooldown, 0) * cooldownScale(move, build, healthPercent);
     const cycle = cooldownStart + cooldown;
     const flags = dotFlags(options);
     const dotDamage = statusDamage;
@@ -414,5 +523,5 @@
     return entries;
   }
 
-  window.MatrixEngine = { data, customData, constants, allPowers, allSpecials, catalog, moveConfig, calculate, damagingHits, severityFor, buildMultiplier, defenseProfile, canonicalSpecialKind };
+  window.MatrixEngine = { data, customData, constants, allPowers, allSpecials, catalog, moveConfig, calculate, damagingHits, severityFor, buildMultiplier, defenseProfile, canonicalSpecialKind, passiveNotes };
 })();
