@@ -74,7 +74,7 @@
   }
 
   function damagingHits(move) {
-    return hitsFor(move).filter((hit) => hit.damage && hit.damage.basis !== "none" && number(hit.count, 0) > 0);
+    return hitsFor(move).filter((hit) => hit.damage && (hit.damage.basis === "power" || !hit.damage.basis) && hit.damage.basis !== "flat" && number(hit.count, 0) > 0);
   }
 
   function baseDamage(move, mode, statValue, statLimit) {
@@ -613,5 +613,5 @@
     return entries;
   }
 
-  window.MatrixEngine = { data, customData, constants, allPowers, allSpecials, catalog, moveConfig, calculate, damagingHits, severityFor, buildMultiplier, defenseProfile, canonicalSpecialKind, passiveNotes };
+  window.MatrixEngine = { data, customData, constants, allPowers, allSpecials, catalog, moveConfig, calculate, damagingHits, severityFor, buildMultiplier, cooldownScale, defenseProfile, canonicalSpecialKind, passiveNotes };
 })();

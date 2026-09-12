@@ -484,7 +484,7 @@
     });
   }
 
-  function matrixFilterRecords() {
+  function matrixFilterRecords(build) {
     const records = [];
     const seen = new Set();
     const add = (label, kind, icon) => {
@@ -495,14 +495,17 @@
     };
     entries.forEach((entry) => {
       const power = data.powers[entry.powerId];
-      if (!power || !entryAllowed(entry, state.build)) return;
+      if (!power || (build && !entryAllowed(entry, build))) return;
       const move = engine.moveConfig(power, entry.standId);
       const special = specialForEntry(entry, move);
       const sourceStatIcon = statIconIds[move.statFolder || move.statType];
       add(move.displayName || entry.powerId, "Move", attackIcon(entry, move));
       add(matrixSource(entry, move), "Source", special ? special.icon : sourceStatIcon);
       add(matrixDamageType(move), "Damage type", statIconIds[matrixDamageType(move)]);
-      if (entry.group === "Specials") add(specialKindLabel(entry.folder), "Special type", special ? special.icon : null);
+      if (entry.group === "Specials") {
+        add(specialKindLabel(entry.folder), "Special type", special ? special.icon : null);
+        add("Special", "Damage type", null);
+      }
     });
     return records.sort((a, b) => a.label.localeCompare(b.label));
   }
@@ -510,7 +513,7 @@
   function renderMatrixFilterOptions(root, query, store) {
     const text = query.trim().toLowerCase();
     const active = new Set(store.filterTokens.map((token) => `${token.kind}:${token.label}`.toLowerCase()));
-    const options = matrixFilterRecords().filter((item) => !active.has(`${item.kind}:${item.label}`.toLowerCase()) && (!text || item.label.toLowerCase().includes(text))).slice(0, 12);
+    const options = matrixFilterRecords(store === state.matrix ? state.build : null).filter((item) => !active.has(`${item.kind}:${item.label}`.toLowerCase()) && (!text || item.label.toLowerCase().includes(text))).slice(0, 12);
     const list = root.querySelector(".matrix-filter-options");
     list.innerHTML = options.length ? options.map((item) => `<button type="button" data-matrix-filter-option="${item.label}" data-matrix-filter-kind="${item.kind}">${iconNode(item.icon, item.label)}<span>${item.kind}</span>${item.label}</button>`).join("") : '<span class="build-search-empty">No matches</span>';
   }
@@ -549,7 +552,7 @@
         return;
       }
       if (event.key !== "Enter") return;
-      const first = matrixFilterRecords().filter((item) => !input.value.trim() || item.label.toLowerCase().includes(input.value.trim().toLowerCase()))[0];
+      const first = matrixFilterRecords(store === state.matrix ? state.build : null).filter((item) => !input.value.trim() || item.label.toLowerCase().includes(input.value.trim().toLowerCase()))[0];
       event.preventDefault();
       addMatrixFilterToken(first || input.value, null, store);
       store.refocusFilter = true;
@@ -782,11 +785,16 @@
 
   function tokensMatch(tokens, attack, source, damageType, specialKind, isSpecialAttack) {
     if (!tokens.length) return true;
-    return tokens.some((token) => token.kind === "Damage type" ? (token.label.toLowerCase() === "special" && isSpecialAttack) || damageType.toLowerCase() === token.label.toLowerCase()
-      : token.kind === "Special type" ? (specialKind || "").toLowerCase() === token.label.toLowerCase()
-      : token.kind === "Source" ? source.toLowerCase() === token.label.toLowerCase()
-      : token.kind === "Move" ? attack.toLowerCase() === token.label.toLowerCase()
-      : `${attack} ${source} ${damageType} ${specialKind || ""}`.toLowerCase().includes(token.label.toLowerCase()));
+    return tokens.some((token) => {
+      if (token.kind === "Damage type") {
+        if (token.label.toLowerCase() === "special") return isSpecialAttack;
+        return damageType.toLowerCase() === token.label.toLowerCase();
+      }
+      if (token.kind === "Special type") return (specialKind || "").toLowerCase() === token.label.toLowerCase();
+      if (token.kind === "Source") return source.toLowerCase() === token.label.toLowerCase();
+      if (token.kind === "Move") return attack.toLowerCase() === token.label.toLowerCase();
+      return `${attack} ${source} ${damageType} ${specialKind || ""}`.toLowerCase().includes(token.label.toLowerCase());
+    });
   }
 
   // Every attack is kept because the winning build depends on which attacks it has to serve,
@@ -857,18 +865,25 @@
     const mode = engineMode(settings.mode);
     const isSurvivalObjective = settings.objective === "survivalBurst" || settings.objective === "survivalDps";
     const defense = isSurvivalObjective ? blendedSurvivalDefense(build, mode) : engine.defenseProfile({ build, mode, defense: state.defense });
+    const healthPercent = Math.max(0, Math.min(100, Number(build.healthPercent) || 100)) / 100;
     const multipliers = new Map();
     const scored = [];
     attacks.forEach((record) => {
-      if (settings.singleSpecialOnly && record.group === "Specials" && (!build.special || record.specialId !== build.special)) return;
+      if (settings.singleSpecialOnly && (!build.special || record.specialId !== build.special)) return;
       if (!attackUsable(record, build)) return;
       let multiplier = multipliers.get(record.signature);
       if (multiplier === undefined) {
         multiplier = engine.buildMultiplier(record.move, mode, { build });
         multipliers.set(record.signature, multiplier);
       }
+      const scale = engine.cooldownScale ? engine.cooldownScale(record.move, build, healthPercent) : 1;
+      const cdStart = Math.max(0, Number(record.move.runtime?.activationTillCooldownStart ?? record.move.runtime?.activationTillEndlagEnd) || 0);
+      const scaledCycle = cdStart + Math.max(0, Number(record.move.baseCooldown) || 0) * scale;
+      const dmg = record.base.dmg * multiplier;
+      const dps = scaledCycle > 0 ? dmg / scaledCycle : 0;
+      const rotationalDps = dps;
       const burst = record.base.burst * multiplier;
-      scored.push({ record, multiplier, dmg: record.base.dmg * multiplier, dps: record.base.dps * multiplier, burst, rotationalDps: record.base.rotationalDps * multiplier, tier: engine.severityFor(record.move, { burst }).tier });
+      scored.push({ record, multiplier, dmg, dps, burst, rotationalDps, tier: engine.severityFor(record.move, { burst }).tier });
     });
     scored.sort(settings.metric === "severity" ? (a, b) => (b.tier - a.tier) || (b.dmg - a.dmg) : (a, b) => b[settings.metric] - a[settings.metric]);
     const picked = [];
@@ -900,7 +915,11 @@
     const chainEndlag = cursor;
     const chainTime = Math.max(lastLanding, chainEndlag);
     const chainDps = chainTime > 0 ? chainDamage / chainTime : 0;
-    const chainCycle = Math.max(chainEndlag, ...picked.map((item) => Math.max(0, Number(item.record.move.baseCooldown) || 0) + Math.max(0, Number(item.record.move.runtime?.activationTillCooldownStart) || 0)), 0);
+    const chainCycle = Math.max(chainEndlag, ...picked.map((item) => {
+      const cdStart = Math.max(0, Number(item.record.move.runtime?.activationTillCooldownStart ?? item.record.move.runtime?.activationTillEndlagEnd) || 0);
+      const cd = Math.max(0, Number(item.record.move.baseCooldown) || 0) * (engine.cooldownScale ? engine.cooldownScale(item.record.move, build, healthPercent) : 1);
+      return cdStart + cd;
+    }), 0);
     const chainRotationalDps = chainCycle > 0 ? chainDamage / chainCycle : 0;
     const score = settings.objective === "dmg" ? chainDamage
       : settings.objective === "dps" ? picked.reduce((sum, item) => sum + item.dps, 0)
@@ -933,16 +952,21 @@
     const rightSpecials = new Set([right.build.special, ...right.best.picked.map((item) => item.record.specialId)].filter(Boolean));
     const leftPowers = new Set(left.best.picked.map((item) => item.record.entry.powerId));
     const rightPowers = new Set(right.best.picked.map((item) => item.record.entry.powerId));
-    const same = (field) => left.build[field] === right.build[field] ? 1 : 0;
-    return (same("champion") + same("trait") + same("title") + same("accessory") + jaccard(leftSpecials, rightSpecials) + jaccard(leftPowers, rightPowers)) / 6;
+    const same = (field) => (left.build[field] && right.build[field] && left.build[field] === right.build[field]) ? 1 : 0;
+    return (same("champion") + same("trait") + same("title") + same("accessory") + same("transformation") + jaccard(leftSpecials, rightSpecials) + jaccard(leftPowers, rightPowers)) / 7;
   }
 
   function diverseBuilds(candidates, limit) {
     const unique = [...candidates.values()].sort((left, right) => right.best.score - left.best.score);
     const selected = [];
     unique.forEach((candidate) => {
-      if (selected.length < limit && selected.every((existing) => buildSimilarity(candidate, existing) < 0.7)) selected.push(candidate);
+      if (selected.length < limit && selected.every((existing) => buildSimilarity(candidate, existing) < 0.65)) selected.push(candidate);
     });
+    if (selected.length < limit) {
+      unique.forEach((candidate) => {
+        if (selected.length < limit && !selected.includes(candidate)) selected.push(candidate);
+      });
+    }
     return selected;
   }
 
@@ -957,33 +981,62 @@
     const tokens = state.sim.auto.filterTokens;
     const attacks = autoBuildAttacks(tokens, settings.mode);
     const pinned = pinnedSpecialId(tokens);
-    let build = { healthPercent: state.build.healthPercent, maxHealth: state.build.maxHealth, scalingMode: state.build.scalingMode, champion: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "" };
-    if (pinned) applyBuildSlot(build, "special", pinned);
     const slots = autoSlotOptions(pinned);
-    const candidates = new Map();
-    const evaluate = (candidate) => {
-      const best = scoreLoadout(candidate, attacks, settings);
-      const key = [candidate.champion, candidate.trait, candidate.traitTier, candidate.title, candidate.accessory, candidate.transformation, candidate.special].join("|");
-      candidates.set(key, { build: Object.assign({}, candidate), best });
-      return best;
-    };
-    let best = evaluate(build);
-    for (let pass = 0; pass < 4; pass += 1) {
-      let improved = false;
-      slots.forEach(([field, options]) => {
-        options.forEach((id) => {
-          const trial = applyBuildSlot(Object.assign({}, build), field, id);
-          if (pinned && trial.special !== pinned) return;
-          const result = evaluate(trial);
-          if (result.score > best.score * (1 + 1e-9) + 1e-9) { best = result; build = trial; improved = true; }
-        });
+
+    const candidateSpecials = pinned ? [pinned] : [...new Set(attacks.map((a) => a.specialId).filter(Boolean))];
+    const seeds = [];
+    if (pinned) {
+      seeds.push({ special: pinned });
+    } else if (settings.singleSpecialOnly) {
+      candidateSpecials.forEach((specialId) => seeds.push({ special: specialId }));
+    } else {
+      seeds.push({ special: "" });
+      candidateSpecials.forEach((specialId) => seeds.push({ special: specialId }));
+      Object.keys(data.transformations || {}).forEach((transId) => {
+        const trans = data.transformations[transId];
+        if (trans && !trans.isSpecial) seeds.push({ transformation: transId, special: "" });
       });
-      if (!improved) break;
     }
+
+    const candidates = new Map();
+    const evaluate = (candidate) => scoreLoadout(candidate, attacks, settings);
+
+    seeds.forEach((seed) => {
+      let build = { healthPercent: state.build.healthPercent, maxHealth: state.build.maxHealth, scalingMode: state.build.scalingMode, champion: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "" };
+      Object.entries(seed).forEach(([field, id]) => applyBuildSlot(build, field, id));
+      if (pinned && build.special !== pinned) applyBuildSlot(build, "special", pinned);
+      let best = evaluate(build);
+
+      for (let pass = 0; pass < 3; pass += 1) {
+        let improved = false;
+        slots.forEach(([field, options]) => {
+          if (field === "transformation" && fullTransformForSpecial(build.special)) return;
+          if (field === "special" && seed.special) return;
+          options.forEach((id) => {
+            const trial = applyBuildSlot(Object.assign({}, build), field, id);
+            if (pinned && trial.special !== pinned) return;
+            if (seed.special && trial.special !== seed.special) return;
+            const result = evaluate(trial);
+            if (result.score > best.score * (1 + 1e-9) + 1e-9) {
+              best = result;
+              build = trial;
+              improved = true;
+            }
+          });
+        });
+        if (!improved) break;
+      }
+
+      if (best.picked.length > 0) {
+        const key = [build.champion, build.trait, build.traitTier, build.title, build.accessory, build.transformation, build.special].join("|");
+        candidates.set(key, { build: Object.assign({}, build), best });
+      }
+    });
+
     const builds = diverseBuilds(candidates, 10);
     state.sim.openBuilds = new Set([0]);
     state.sim.selected = 0;
-    state.sim.result = { build: builds[0]?.build || build, best: builds[0]?.best || best, builds, settings, attackCount: attacks.length, pinned };
+    state.sim.result = { build: builds[0]?.build || Object.assign({}, seeds[0] || {}), best: builds[0]?.best || evaluate(builds[0]?.build || {}), builds, settings, attackCount: attacks.length, pinned };
   }
 
   function passiveNotesMarkup(build) {
