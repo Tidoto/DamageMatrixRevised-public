@@ -937,10 +937,6 @@
     return match ? match.id : null;
   }
 
-  function autoSlotOptions(pinned) {
-    return BUILD_SLOTS.filter((slot) => !(slot.field === "special" && pinned)).map((slot) => [slot.field, ["", ...Object.keys(slot.records() || {})]]);
-  }
-
   function jaccard(left, right) {
     const union = new Set([...left, ...right]);
     if (!union.size) return 1;
@@ -956,18 +952,136 @@
     return (same("champion") + same("trait") + same("title") + same("accessory") + same("transformation") + jaccard(leftSpecials, rightSpecials) + jaccard(leftPowers, rightPowers)) / 7;
   }
 
-  function diverseBuilds(candidates, limit) {
-    const unique = [...candidates.values()].sort((left, right) => right.best.score - left.best.score);
-    const selected = [];
-    unique.forEach((candidate) => {
-      if (selected.length < limit && selected.every((existing) => buildSimilarity(candidate, existing) < 0.65)) selected.push(candidate);
-    });
-    if (selected.length < limit) {
-      unique.forEach((candidate) => {
-        if (selected.length < limit && !selected.includes(candidate)) selected.push(candidate);
-      });
+  function emptyBuild() {
+    return {
+      healthPercent: state.build.healthPercent,
+      maxHealth: state.build.maxHealth,
+      scalingMode: state.build.scalingMode,
+      champion: "",
+      trait: "",
+      traitTier: 0,
+      title: "",
+      accessory: "",
+      transformation: "",
+      special: "",
+    };
+  }
+
+  const SIMULATION_FIELDS = ["champion", "trait", "title", "accessory", "transformation", "special"];
+
+  function randomChoice(values, random) {
+    if (!values.length) return "";
+    return values[Math.floor((random || Math.random)() * values.length)];
+  }
+
+  function simulationFieldValues(field, pinned, settings, candidateSpecials) {
+    if (field === "champion") return ["", ...Object.keys(data.champions || {})];
+    if (field === "trait") return ["", ...Object.keys(data.traits || {})];
+    if (field === "title") return ["", ...Object.keys(data.titles || {})];
+    if (field === "accessory") return ["", ...Object.keys(data.accessories || {})];
+    if (field === "transformation") return ["", ...Object.keys(data.transformations || {})];
+    if (field === "special") {
+      if (pinned) return [pinned];
+      const specials = [...new Set(candidateSpecials || [])];
+      if (settings.singleSpecialOnly) return specials;
+      return ["", ...specials];
     }
-    return selected;
+    return [];
+  }
+
+  function repairSimulationBuild(source, pinned, settings, candidateSpecials) {
+    const child = emptyBuild();
+    ["champion", "trait", "title", "accessory"].forEach((field) => {
+      if (source[field] && data[`${field === "accessory" ? "accessorie" : field}s`]?.[source[field]]) applyBuildSlot(child, field, source[field]);
+    });
+
+    let special = pinned || source.special || "";
+    let transformation = source.transformation || "";
+    if (special && !data.specials[special]) special = "";
+    if (transformation && !data.transformations[transformation]) transformation = "";
+    if (settings.singleSpecialOnly && special && !candidateSpecials.includes(special)) special = "";
+
+    const transformationRecord = transformation && data.transformations[transformation];
+    if (transformationRecord?.isSpecial) {
+      const pairedSpecial = transformationSpecialId(transformation);
+      if (pinned && pairedSpecial !== pinned) transformation = "";
+      else special = pairedSpecial;
+    }
+    if (transformation && !data.transformations[transformation].isSpecial && transformForSpecial(special)) transformation = "";
+    const requiredFullTransformation = fullTransformForSpecial(special);
+    if (requiredFullTransformation) transformation = requiredFullTransformation.id;
+
+    child.special = special;
+    child.transformation = transformation;
+    if (pinned) child.special = pinned;
+    return child;
+  }
+
+  function simulationBuildValid(build, pinned, settings, candidateSpecials) {
+    if (pinned && build.special !== pinned) return false;
+    if (settings.singleSpecialOnly && (!build.special || !candidateSpecials.includes(build.special))) return false;
+    const transformation = build.transformation && data.transformations[build.transformation];
+    if (transformation?.isSpecial && transformationSpecialId(build.transformation) !== build.special) return false;
+    if (transformation && !transformation.isSpecial && transformForSpecial(build.special)) return false;
+    const requiredFullTransformation = fullTransformForSpecial(build.special);
+    return !requiredFullTransformation || build.transformation === requiredFullTransformation.id;
+  }
+
+  function randomSimulationBuild(pinned, settings, candidateSpecials, random, seed) {
+    const build = Object.assign(emptyBuild(), seed || {});
+    SIMULATION_FIELDS.forEach((field) => {
+      if (seed && Object.hasOwn(seed, field)) return;
+      build[field] = randomChoice(simulationFieldValues(field, pinned, settings, candidateSpecials), random);
+    });
+    return repairSimulationBuild(build, pinned, settings, candidateSpecials);
+  }
+
+  function crossoverSimulationBuild(parentA, parentB, random) {
+    const child = emptyBuild();
+    SIMULATION_FIELDS.forEach((field) => { child[field] = (random() < 0.5 ? parentA : parentB)[field] || ""; });
+    return child;
+  }
+
+  function mutateSimulationBuild(build, random, progress, pinned, settings, candidateSpecials) {
+    const child = Object.assign({}, build);
+    const mutationRate = 0.08 + progress * 0.1;
+    SIMULATION_FIELDS.forEach((field) => {
+      if (field !== "special" || !pinned) {
+        if (random() < mutationRate) child[field] = randomChoice(simulationFieldValues(field, pinned, settings, candidateSpecials), random);
+      }
+    });
+    return child;
+  }
+
+  function simulationBuildKey(build) {
+    return SIMULATION_FIELDS.map((field) => build[field] || "").concat(build.traitTier || 0).join("|");
+  }
+
+  function simulationDistance(left, right) {
+    return 1 - buildSimilarity(left, right);
+  }
+
+  function evaluateBuild(build, attacks, settings) {
+    const candidate = Object.assign({}, build);
+    let result = scoreLoadout(candidate, attacks, settings);
+    const selectedSpecial = candidate.special && data.specials[candidate.special];
+    const selectedSpecialName = selectedSpecial && (selectedSpecial.displayName || selectedSpecial.id);
+    const ownsSelectedSpecialAttack = (item) => item.record.specialId === candidate.special
+      || item.record.move.specialCategory === candidate.special
+      || String(item.record.source || "").toLowerCase() === String(selectedSpecialName || "").toLowerCase();
+    if (candidate.special && result.picked.every((item) => !ownsSelectedSpecialAttack(item))) {
+      const withoutSpecial = Object.assign({}, candidate, { special: "" });
+      const specialChangedMultiplier = result.picked.some((item) => {
+        const withSpecial = engine.buildMultiplier(item.record.move, engineMode(settings.mode), { build: candidate });
+        const without = engine.buildMultiplier(item.record.move, engineMode(settings.mode), { build: withoutSpecial });
+        return Math.abs(withSpecial - without) > 1e-9;
+      });
+      if (!specialChangedMultiplier) {
+        candidate.special = "";
+        result = scoreLoadout(candidate, attacks, settings);
+      }
+    }
+    return { build: candidate, best: result };
   }
 
   function runAutoBuild() {
@@ -981,7 +1095,6 @@
     const tokens = state.sim.auto.filterTokens;
     const attacks = autoBuildAttacks(tokens, settings.mode);
     const pinned = pinnedSpecialId(tokens);
-    const slots = autoSlotOptions(pinned);
 
     const candidateSpecials = pinned ? [pinned] : [...new Set(attacks.map((a) => a.specialId).filter(Boolean))];
     const seeds = [];
@@ -998,45 +1111,34 @@
       });
     }
 
-    const candidates = new Map();
-    const evaluate = (candidate) => scoreLoadout(candidate, attacks, settings);
+    const populationSize = Math.min(120, Math.max(40, attacks.length * 2 || 40));
+    const generations = Math.min(80, Math.max(30, 14 + Math.ceil(Math.sqrt(attacks.length || 1)) * 3));
+    const seedBuilds = seeds.map((seed) => randomSimulationBuild(pinned, settings, candidateSpecials, Math.random, seed));
+    const builds = window.NichingGeneticOptimizer.optimize({
+      populationSize,
+      generations,
+      eliteCount: Math.max(4, Math.floor(populationSize * 0.1)),
+      nicheRadius: 0.35,
+      resultLimit: 10,
+      seeds: seedBuilds,
+      create: (random) => randomSimulationBuild(pinned, settings, candidateSpecials, random),
+      repair: (build) => repairSimulationBuild(build, pinned, settings, candidateSpecials),
+      valid: (build) => simulationBuildValid(build, pinned, settings, candidateSpecials),
+      crossover: crossoverSimulationBuild,
+      mutate: (build, random, progress) => mutateSimulationBuild(build, random, progress, pinned, settings, candidateSpecials),
+      keyOf: simulationBuildKey,
+      evaluate: (build) => {
+        const candidate = evaluateBuild(build, attacks, settings);
+        return candidate.best.picked.length ? { fitness: candidate.best.score, genome: candidate.build, build: candidate.build, best: candidate.best } : null;
+      },
+      distance: simulationDistance,
+    }).map((candidate) => ({ build: candidate.build, best: candidate.best }));
 
-    seeds.forEach((seed) => {
-      let build = { healthPercent: state.build.healthPercent, maxHealth: state.build.maxHealth, scalingMode: state.build.scalingMode, champion: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "" };
-      Object.entries(seed).forEach(([field, id]) => applyBuildSlot(build, field, id));
-      if (pinned && build.special !== pinned) applyBuildSlot(build, "special", pinned);
-      let best = evaluate(build);
-
-      for (let pass = 0; pass < 3; pass += 1) {
-        let improved = false;
-        slots.forEach(([field, options]) => {
-          if (field === "transformation" && fullTransformForSpecial(build.special)) return;
-          if (field === "special" && seed.special) return;
-          options.forEach((id) => {
-            const trial = applyBuildSlot(Object.assign({}, build), field, id);
-            if (pinned && trial.special !== pinned) return;
-            if (seed.special && trial.special !== seed.special) return;
-            const result = evaluate(trial);
-            if (result.score > best.score * (1 + 1e-9) + 1e-9) {
-              best = result;
-              build = trial;
-              improved = true;
-            }
-          });
-        });
-        if (!improved) break;
-      }
-
-      if (best.picked.length > 0) {
-        const key = [build.champion, build.trait, build.traitTier, build.title, build.accessory, build.transformation, build.special].join("|");
-        candidates.set(key, { build: Object.assign({}, build), best });
-      }
-    });
-
-    const builds = diverseBuilds(candidates, 10);
     state.sim.openBuilds = new Set([0]);
     state.sim.selected = 0;
-    state.sim.result = { build: builds[0]?.build || Object.assign({}, seeds[0] || {}), best: builds[0]?.best || evaluate(builds[0]?.build || {}), builds, settings, attackCount: attacks.length, pinned };
+    const fallbackBuild = randomSimulationBuild(pinned, settings, candidateSpecials, Math.random, seeds[0] || {});
+    const fallback = evaluateBuild(fallbackBuild, attacks, settings);
+    state.sim.result = { build: builds[0]?.build || fallback.build, best: builds[0]?.best || fallback.best, builds, settings, attackCount: attacks.length, pinned, algorithm: "Genetic Algorithm with Niching" };
   }
 
   function passiveNotesMarkup(build) {
@@ -1241,7 +1343,7 @@
 
   function autoResultMarkup() {
     const result = state.sim.result;
-    if (!result) return '<p class="severity-explain">Pick an objective and a source filter, then run the search. The optimizer walks one slot at a time, keeps the best set of attacks the build has to serve, and honours the transformation and special exclusion rules.</p>';
+    if (!result) return '<p class="severity-explain">Pick an objective and a source filter, then run the Genetic Algorithm with Niching. Every generated build is repaired and checked against the transformation and special exclusion rules before scoring.</p>';
     const settings = result.settings;
     const objectiveLabel = (OBJECTIVES.find(([id]) => id === settings.objective) || [])[1];
     const buildList = result.builds.map((candidate, index) => {
@@ -1254,7 +1356,7 @@
       const rotation = best.rotation.length ? `<table class="matrix-table auto-rotation"><thead><tr><th>#</th><th>Attack</th><th>Source</th><th class="num">DMG</th><th class="num">DPS</th><th class="num">Burst</th><th class="num">Start</th><th class="num">Lands</th><th class="num">Endlag</th><th class="num">Buff</th><th class="num">Tier</th></tr></thead><tbody>${best.rotation.map((item, rotationIndex) => `<tr><td>${rotationIndex + 1}</td><td><strong>${item.record.attack}</strong></td><td>${item.record.source}</td><td class="num">${format(item.dmg)}</td><td class="num">${format(item.dps)}</td><td class="num">${format(item.burst)}</td><td class="num">${seconds(item.startsAt)}</td><td class="num">${seconds(item.landsAt)}</td><td class="num">${seconds(item.record.endlag)}</td><td class="num">${format(item.multiplier)}\u00d7</td><td class="num"><span class="tier tier-${item.tier}">${item.tier}</span></td></tr>`).join("")}</tbody></table>` : '<p class="severity-explain">No attack is usable with this filter and special limit.</p>';
       return `<details data-auto-build="${index}"${state.sim.openBuilds.has(index) ? " open" : ""}><summary><span>Build ${index + 1}</span><strong>${format(best.score)}</strong></summary><div class="auto-build-content"><div class="auto-result-head"><b>${objectiveLabel}</b><span>${scoreLine}</span></div><div class="auto-result-grid">${slots}</div><div class="auto-result-grid">${defenseLine}</div><div class="auto-result-grid">${damageLine}</div><div class="section-title"><h3>Rotation</h3><span>${best.picked.length} of ${best.usable} usable attacks \u00b7 ranked by ${settings.metric} \u00b7 slowest to land first</span></div>${rotation}<small class="severity-explain">${result.attackCount} attacks scanned${result.pinned ? ` \u00b7 special pinned to ${slotLabel("special", result.pinned)}` : ""}. Reduction stacking: ${state.defense.stacking}.</small></div></details>`;
     }).join("");
-    return `<div class="auto-result"><div class="section-title"><h3>${objectiveLabel}</h3><span>${result.builds.length} diverse builds</span></div><div class="auto-build-list">${buildList}</div></div>`;
+    return `<div class="auto-result"><div class="section-title"><h3>${objectiveLabel}</h3><span>${result.builds.length} diverse builds · ${result.algorithm}</span></div><div class="auto-build-list">${buildList}</div></div>`;
   }
 
   function bindBuildCatalog(view) {

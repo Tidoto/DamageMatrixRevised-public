@@ -183,7 +183,9 @@
   function applyBestCaseCombatBoosts(multiplier, boosts, move, mode, build, toggles) {
     if (boosts.CombatDamageBoost && typeof boosts.CombatDamageBoost.boost === "number") applyFactor(multiplier, 1 + boosts.CombatDamageBoost.boost);
     if (boosts.CombatEntryBuff && boosts.CombatEntryBuff.damage) addDamageBoost(multiplier, boosts.CombatEntryBuff.damage, move);
-    if (boosts.FirstAttackDamageBoost) {
+    // Do not apply first-attack damage boosts as a permanent always-on effect; they are conditional by combat timing and should only be counted when
+    // the simulator explicitly models that state. Keeping them on globally produces fake permanent stacks like Shadow's 100% strength bonus.
+    if (boosts.FirstAttackDamageBoost && false) {
       const first = boosts.FirstAttackDamageBoost;
       const dark = toggles.dungeon || !toggles.daytime;
       const boost = dark && typeof first.darkBoost === "number" ? first.darkBoost : number(first.boost, 0);
@@ -276,7 +278,6 @@
   const BEST_CASE_ASSUMPTION_FAMILIES = {
     CombatDamageBoost: "assumes its timed on-combat-entry damage buff is always up",
     CombatEntryBuff: "assumes its timed on-combat-entry damage buff is always up",
-    FirstAttackDamageBoost: "assumes every attack qualifies as the buffed \"first attack\"",
     AttackCycleDamage: "assumes the every-Nth-attack condition is always met",
     AttackCycleStun: "assumes its mob/boss bonus-damage condition is always met",
     StrengthToChakraDamageBuff: "assumes the Strength-triggered Chakra buff is always active",
