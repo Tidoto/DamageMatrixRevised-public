@@ -24,7 +24,7 @@
   try { savedBuilds = JSON.parse(localStorage.getItem(SAVED_BUILDS_KEY) || "null") || {}; } catch (error) {}
   const persistSavedBuilds = () => localStorage.setItem(SAVED_BUILDS_KEY, JSON.stringify(savedBuilds));
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-  const state = { search: "", selected: null, customDraft: null, customDirty: false, statValue: 1000000, statLimit: 100, theme: localStorage.getItem("damage-matrix-theme") || "dark", openGroups: new Set(["Powers", "Specials"]), activeView: "attacks", dot: { total: true, dps: true, burst: false }, defense: { stacking: "multiplicative", window: 10, inCombat: true, outOfCombat: false, daytime: false, dungeon: false }, build: { healthPercent: 100, maxHealth: 1000, champion: "", championQuery: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "", attacks: [], scalingMode: "multiplicative" }, buildSearch: {}, buildLibrary: { name: "", selected: "", confirmOverwrite: false, confirmDelete: false }, builds: { search: "", selected: null, openGroups: new Set(["Champions"]), matrixOpen: true, catalogOpen: true }, sim: { objective: "burst", metric: "dps", extraAttacks: 2, auto: { filter: "", filterTokens: [] }, openBuilds: new Set([0]), selected: 0, result: null }, matrix: { mode: "boss", category: "all", includeCustoms: true, excludeDamageless: true, filter: "", filterTokens: [], sort: "attack", direction: "asc" }, rebalance: { selected: [], drafts: {}, originals: {}, dirty: {}, exclude: { damage: false, tickCount: false, duration: false, endlag: false, cooldown: false }, target: "dps", search: "" } };
+  const state = { search: "", selected: null, customDraft: null, customDirty: false, statValue: 1000000, statLimit: 100, theme: localStorage.getItem("damage-matrix-theme") || "dark", openGroups: new Set(["Powers", "Specials"]), activeView: "attacks", dot: { enabled: true, total: true, dps: true, burst: false }, defense: { stacking: "multiplicative", window: 10, inCombat: true, outOfCombat: false, daytime: false, dungeon: false }, build: { healthPercent: 100, maxHealth: 1000, champion: "", championQuery: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "", attacks: [], scalingMode: "multiplicative" }, buildSearch: {}, buildLibrary: { name: "", selected: "", confirmOverwrite: false, confirmDelete: false }, builds: { search: "", selected: null, openGroups: new Set(["Champions"]), matrixOpen: true, catalogOpen: true }, sim: { objective: "burst", metric: "dps", extraAttacks: 2, auto: { filter: "", filterTokens: [] }, openBuilds: new Set([0]), selected: 0, result: null }, matrix: { mode: "boss", category: "all", includeCustoms: true, excludeDamageless: true, filter: "", filterTokens: [], sort: "attack", direction: "asc" }, rebalance: { selected: [], drafts: {}, originals: {}, dirty: {}, exclude: { damage: false, tickCount: false, duration: false, endlag: false, cooldown: false }, target: "dps", search: "" } };
   const entries = [];
   const $ = (selector) => document.querySelector(selector);
   const format = (value) => value === null || value === undefined || !Number.isFinite(value) ? "-" : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -776,9 +776,13 @@
     return build;
   }
 
-  function tokensMatch(tokens, attack, source, damageType, specialKind) {
+  function specialDamageTokenSelected(tokens) {
+    return tokens.some((token) => token.kind === "Damage type" && token.label.toLowerCase() === "special");
+  }
+
+  function tokensMatch(tokens, attack, source, damageType, specialKind, isSpecialAttack) {
     if (!tokens.length) return true;
-    return tokens.some((token) => token.kind === "Damage type" ? damageType.toLowerCase() === token.label.toLowerCase()
+    return tokens.some((token) => token.kind === "Damage type" ? (token.label.toLowerCase() === "special" && isSpecialAttack) || damageType.toLowerCase() === token.label.toLowerCase()
       : token.kind === "Special type" ? (specialKind || "").toLowerCase() === token.label.toLowerCase()
       : token.kind === "Source" ? source.toLowerCase() === token.label.toLowerCase()
       : token.kind === "Move" ? attack.toLowerCase() === token.label.toLowerCase()
@@ -799,7 +803,7 @@
       const attack = move.displayName || entry.powerId;
       const source = matrixSource(entry, move);
       const specialKind = entry.group === "Specials" ? specialKindLabel(entry.folder) : "";
-      if (!tokensMatch(tokens, attack, source, matrixDamageType(move), specialKind)) return;
+      if (!tokensMatch(tokens, attack, source, matrixDamageType(move), specialKind, entry.group === "Specials")) return;
       const profile = engine.calculate(move, { statValue: state.statValue, statLimit: state.statLimit, dot: state.dot, build: {} })[key];
       const runtime = move.runtime || {};
       const startup = Math.max(Number(runtime.activationTillFirstHitbox) || 0, 0);
@@ -856,6 +860,7 @@
     const multipliers = new Map();
     const scored = [];
     attacks.forEach((record) => {
+      if (settings.singleSpecialOnly && record.group === "Specials" && (!build.special || record.specialId !== build.special)) return;
       if (!attackUsable(record, build)) return;
       let multiplier = multipliers.get(record.signature);
       if (multiplier === undefined) {
@@ -947,6 +952,7 @@
       objective: state.sim.objective,
       metric: state.sim.metric,
       count: 1 + Math.max(0, Number(state.sim.extraAttacks) || 0),
+      singleSpecialOnly: specialDamageTokenSelected(state.sim.auto.filterTokens),
     };
     const tokens = state.sim.auto.filterTokens;
     const attacks = autoBuildAttacks(tokens, settings.mode);
@@ -1470,6 +1476,7 @@
   function renderDetails() {
     const view = $("#view-details");
     view.innerHTML = `<header class="matrix-header"><div><span class="eyebrow">REFERENCE</span><h2>How calculations work</h2></div></header><div class="details-guide"><section><h3>Starting damage</h3><p>Each move has one or more hits. The calculator finds the base damage for the chosen target mode, multiplies it by each hit's damage multiplier, then multiplies by that hit's count. Adding those hit totals gives direct damage.</p><p>Boss mode starts from the move's BossDMG value. PvP starts from PlayerDMG. PvE starts from your stat value, your stat limit, and the move's PvE multiplier.</p></section><section><h3>Build buffs</h3><p>Your champion, trait, title, gear, and transformation can add damage for a matching stat, special, or target mode. In Multiplicative mode, each matching buff multiplies the running value. In Additive mode, the bonus portions are added together before they are applied.</p><p>For example, two +20% matching buffs become 1.2 x 1.2 = 1.44 in Multiplicative mode, or 1 + 0.2 + 0.2 = 1.4 in Additive mode.</p></section><section><h3>Damage over time</h3><p>A status effect with DoT is calculated separately after direct damage. Its tick damage uses its listed basis, applies the same build multiplier, then multiplies by its number of ticks. It only applies when the status can affect the selected target mode.</p><p>The three DoT checkboxes on an attack decide where that value is included: Total Damage, DPS, Active DPS, and Burst. By default it counts in total damage and DPS, but not burst.</p></section><section><h3>Timing and rate metrics</h3><p>DPS divides damage by the full cycle, which is cooldown start plus base cooldown. Active DPS divides damage by the move duration. Burst divides damage by startup plus duration, representing how quickly its damage first resolves.</p><p>For a chosen rotation, attacks are scheduled one after another using their endlag. Chain burst uses the time until the final hit lands. The repeating rotation uses the longer of the chained endlag and its slowest cooldown cycle.</p></section><section><h3>Defense and survivability</h3><p>Health bonuses raise maximum health. Damage reduction lowers incoming damage using either multiplicative or additive stacking, selected in Builds. Effective HP is maximum health divided by the damage taken fraction.</p><p>Survivable DPS uses the chosen sustain window, your effective health, and any continuous healing. It estimates the incoming DPS that would empty the health pool exactly at the end of that window.</p></section><section><h3>Severity and rebalance</h3><p>Severity is a 0 to 9 estimate based on burst damage, largest hitbox size, duration, and endlag. A move can override that result with a manual tier.</p><p>Rebalance takes the first selected move as the baseline. It adjusts the other moves toward the same chosen metric by changing damage first, then tick count or timing controls that are not locked.</p></section></div>`;
+    view.innerHTML = view.innerHTML.replace(`<section><h3>Damage over time</h3><p>A status effect with DoT is calculated separately after direct damage. Its tick damage uses its listed basis, applies the same build multiplier, then multiplies by its number of ticks. It only applies when the status can affect the selected target mode.</p><p>The three DoT checkboxes on an attack decide where that value is included: Total Damage, DPS, Active DPS, and Burst. By default it counts in total damage and DPS, but not burst.</p></section>`, `<section><h3>Damage over time</h3><p>A status effect with DoT is calculated separately after direct damage. Its listed DoT multiplier is the total status damage, then that total is split across its ticks. Burn records that show a 0.5 multiplier over 10 ticks are 50% total extra damage: 5% per tick for 10 ticks. It only applies when the status can affect the selected target mode.</p><p>The top Include DoT effects checkbox controls whether DoT contributes to calculations globally. The three DoT checkboxes on an attack decide where that value is included: Total Damage, DPS, Active DPS, and Burst. By default it counts in total damage and DPS, but not burst.</p></section>`);
   }
 
   function renderAttack() {
@@ -1536,6 +1543,8 @@
   $("#theme-toggle").onclick = () => { state.theme = state.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = state.theme; localStorage.setItem("damage-matrix-theme", state.theme); };
   $("#damage-scaling").value = state.build.scalingMode;
   $("#damage-scaling").onchange = (event) => { state.build.scalingMode = event.target.value; state.sim.result = null; renderMatrix(); renderBuilds(); renderSimulation(); if (state.selected) renderAttack(); };
+  $("#include-dot-effects").checked = state.dot.enabled;
+  $("#include-dot-effects").onchange = (event) => { state.dot.enabled = event.target.checked; state.sim.result = null; renderMatrix(); renderBuilds(); renderSimulation(); if (state.selected) renderAttack(); };
   $("#allow-custom-moves").checked = state.matrix.includeCustoms;
   $("#allow-custom-moves").onchange = (event) => { state.matrix.includeCustoms = event.target.checked; state.sim.result = null; renderMatrix(); renderBuilds(); renderSimulation(); };
   document.documentElement.dataset.theme = state.theme;

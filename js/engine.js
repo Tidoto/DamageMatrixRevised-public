@@ -15,6 +15,7 @@
 
   function dotFlags(options) {
     const flags = options && options.dot || {};
+    if (flags.enabled === false) return { total: false, dps: false, burst: false };
     return { total: flags.total !== false, dps: flags.dps !== false, burst: flags.burst !== false };
   }
 
@@ -348,16 +349,20 @@
       const target = status.target || "both";
       const playerTarget = mode === "duel";
       const applies = target === "both" || (playerTarget ? target === "players" : target === "mobs");
-      let tickDamage = 0;
+      let totalDamage = 0;
       const basis = dot.basis || "boss";
-      if (basis === "power") tickDamage = number(statValue, 0) * number(statLimit, 100) / 100 * number(move.damageMultiplier, 1) * number(dot.totalMultiplier, 0);
-      else if (basis === "fixed") tickDamage = number(dot.totalMultiplier, 0);
-      else tickDamage = number(move.bossDamage, 0) * number(dot.totalMultiplier, 0);
+      const targetMaxHealth = Math.max(1, number(options && options.build && options.build.maxHealth, 1000));
+      if (basis === "power") totalDamage = number(statValue, 0) * number(statLimit, 100) / 100 * number(move.damageMultiplier, 1) * number(dot.totalMultiplier, 0);
+      else if (basis === "flat") totalDamage = number(dot.totalMultiplier, 0) * (targetMaxHealth / 1000);
+      else if (basis === "percentMaxHealth") totalDamage = number(dot.totalMultiplier, 0) * targetMaxHealth;
+      else if (basis === "fixed") totalDamage = number(dot.totalMultiplier, 0);
+      else totalDamage = number(move.bossDamage, 0) * number(dot.totalMultiplier, 0);
       const ticks = number(dot.ticks, 1);
       const burstDamage = number(status.burstDamage, number(status.data && status.data.burstDamage, number(status.burst && status.burst.damage, 0)));
-      tickDamage *= buildMultiplier(move, mode, options);
+      totalDamage *= buildMultiplier(move, mode, options);
       const duration = number(status.duration, 0);
-      const total = tickDamage * ticks;
+      const tickDamage = ticks > 0 ? totalDamage / ticks : totalDamage;
+      const total = totalDamage;
       return { status, effect: status.effect, applies, ticks, tickDamage, duration, interval: ticks > 0 && duration > 0 ? duration / ticks : null, perSecond: duration > 0 ? total / duration : null, total, burstDamage };
     });
   }
