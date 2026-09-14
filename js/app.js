@@ -24,7 +24,7 @@
   try { savedBuilds = JSON.parse(localStorage.getItem(SAVED_BUILDS_KEY) || "null") || {}; } catch (error) {}
   const persistSavedBuilds = () => localStorage.setItem(SAVED_BUILDS_KEY, JSON.stringify(savedBuilds));
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-  const state = { search: "", selected: null, customDraft: null, customDirty: false, statValue: 1000000, statLimit: 100, theme: localStorage.getItem("damage-matrix-theme") || "dark", openGroups: new Set(["Powers", "Specials"]), activeView: "attacks", dot: { enabled: true, total: true, dps: true, burst: false }, defense: { stacking: "multiplicative", window: 10, inCombat: true, outOfCombat: false, daytime: false, dungeon: false }, build: { healthPercent: 100, maxHealth: 1000, champion: "", championQuery: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "", attacks: [], scalingMode: "multiplicative" }, buildSearch: {}, buildLibrary: { name: "", selected: "", confirmOverwrite: false, confirmDelete: false }, builds: { search: "", selected: null, openGroups: new Set(["Champions"]), matrixOpen: true, catalogOpen: true }, sim: { objective: "burst", metric: "dps", extraAttacks: 2, auto: { filter: "", filterTokens: [] }, openBuilds: new Set([0]), selected: 0, result: null }, matrix: { mode: "boss", category: "all", includeCustoms: true, excludeDamageless: true, filter: "", filterTokens: [], sort: "attack", direction: "asc" }, rebalance: { selected: [], drafts: {}, originals: {}, dirty: {}, exclude: { damage: false, tickCount: false, duration: false, endlag: false, cooldown: false }, target: "dps", search: "" } };
+  const state = { search: "", selected: null, customDraft: null, customDirty: false, statValue: 1000000, statLimit: 100, theme: localStorage.getItem("damage-matrix-theme") || "dark", openGroups: new Set(["Powers", "Specials"]), activeView: "attacks", dot: { enabled: true, total: true, dps: true, burst: false }, defense: { stacking: "multiplicative", window: 10, inCombat: true, outOfCombat: false, daytime: false, dungeon: false, dimension: "" }, build: { healthPercent: 100, maxHealth: 1000, champion: "", championQuery: "", trait: "", traitTier: 0, title: "", accessory: "", transformation: "", special: "", attacks: [], scalingMode: "multiplicative" }, buildSearch: {}, buildLibrary: { name: "", selected: "", confirmOverwrite: false, confirmDelete: false }, builds: { search: "", selected: null, openGroups: new Set(["Champions"]), matrixOpen: true, catalogOpen: true }, sim: { objective: "burst", metric: "dps", extraAttacks: 2, auto: { filter: "", filterTokens: [] }, openBuilds: new Set([0]), selected: 0, result: null }, matrix: { mode: "boss", category: "all", includeCustoms: true, excludeDamageless: true, filter: "", filterTokens: [], sort: "attack", direction: "asc" }, rebalance: { selected: [], drafts: {}, originals: {}, dirty: {}, exclude: { damage: false, tickCount: false, duration: false, endlag: false, cooldown: false }, target: "dps", search: "" } };
   const entries = [];
   const $ = (selector) => document.querySelector(selector);
   const format = (value) => value === null || value === undefined || !Number.isFinite(value) ? "-" : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -360,6 +360,7 @@
 
   function entryAllowed(entry, build) {
     const transformation = build.transformation && data.transformations && data.transformations[build.transformation];
+    if (transformation?.isSpecial && transformationSpecialId(build.transformation) !== (build.special || "")) return false;
     if (transformation && !transformation.isSpecial && transformForSpecial(entry.specialId)) return false;
     if (fullTransformForSpecial(build.special)) return entry.specialId === build.special;
     if (entry.group === "Powers" || entry.specialId === build.special) return true;
@@ -832,6 +833,7 @@
 
   function attackUsable(record, build) {
     const transformation = build.transformation && data.transformations[build.transformation];
+    if (transformation?.isSpecial && transformationSpecialId(build.transformation) !== (build.special || "")) return false;
     if (transformation && !transformation.isSpecial && transformForSpecial(record.specialId)) return false;
     // A Full transformation locks the kit: powers and every other special are unusable.
     if (fullTransformForSpecial(build.special)) return record.specialId === build.special;
@@ -861,7 +863,24 @@
     });
   }
 
+  // Kyoshiro-style "first attack after crossing a low-health threshold" can't be tracked as real
+  // combat state, but the simulation's rotation IS ordered (slowest-landing scheduled first), so
+  // the best-case assumption is: the rotation's first scheduled attack gets the one-time bonus,
+  // every other attack in the rotation doesn't.
+  function applyRotationFirstAttackBonus(rotation, build, healthPercent) {
+    if (!rotation.length) return;
+    const champion = build.champion && data.champions[build.champion];
+    const berserker = champion && champion.Boosts && champion.Boosts.LowHealthBerserker;
+    if (!berserker || typeof berserker.firstAttackMultiplier !== "number") return;
+    if (healthPercent > Number(berserker.threshold ?? 0)) return;
+    rotation[0].dmg *= berserker.firstAttackMultiplier;
+  }
+
   function scoreLoadout(build, attacks, settings) {
+    const transformation = build.transformation && data.transformations[build.transformation];
+    if (transformation?.isSpecial && transformationSpecialId(build.transformation) !== (build.special || "")) {
+      return { score: -Infinity, picked: [], chainDamage: 0, chainTime: 0, chainEndlag: 0, chainDps: 0, chainCycle: 0, chainRotationalDps: 0, rotation: [], defense: engine.defenseProfile({ build, mode: engineMode(settings.mode), defense: state.defense }), usable: 0 };
+    }
     const mode = engineMode(settings.mode);
     const isSurvivalObjective = settings.objective === "survivalBurst" || settings.objective === "survivalDps";
     const defense = isSurvivalObjective ? blendedSurvivalDefense(build, mode) : engine.defenseProfile({ build, mode, defense: state.defense });
@@ -873,7 +892,7 @@
       if (!attackUsable(record, build)) return;
       let multiplier = multipliers.get(record.signature);
       if (multiplier === undefined) {
-        multiplier = engine.buildMultiplier(record.move, mode, { build });
+        multiplier = engine.buildMultiplier(record.move, mode, { build, defense: state.defense });
         multipliers.set(record.signature, multiplier);
       }
       const scale = engine.cooldownScale ? engine.cooldownScale(record.move, build, healthPercent) : 1;
@@ -900,10 +919,11 @@
       picked.push(item);
       return picked.length >= settings.count;
     });
-    const chainDamage = picked.reduce((sum, item) => sum + item.dmg, 0);
     // You can act again after endlag, but an attack's damage is not banked until its
     // hitboxes stop, so the chain ends at the last landing rather than the last endlag.
     const rotation = picked.slice().sort((a, b) => b.record.tail - a.record.tail);
+    applyRotationFirstAttackBonus(rotation, build, healthPercent);
+    const chainDamage = picked.reduce((sum, item) => sum + item.dmg, 0);
     let cursor = 0;
     let lastLanding = 0;
     rotation.forEach((item) => {
@@ -1069,7 +1089,13 @@
     const ownsSelectedSpecialAttack = (item) => item.record.specialId === candidate.special
       || item.record.move.specialCategory === candidate.special
       || String(item.record.source || "").toLowerCase() === String(selectedSpecialName || "").toLowerCase();
+    const requiredSpecialFromTransformation = candidate.transformation && data.transformations[candidate.transformation]?.isSpecial
+      ? transformationSpecialId(candidate.transformation)
+      : "";
     if (candidate.special && result.picked.every((item) => !ownsSelectedSpecialAttack(item))) {
+      if (requiredSpecialFromTransformation && candidate.special !== requiredSpecialFromTransformation) {
+        return { build: candidate, best: result };
+      }
       const withoutSpecial = Object.assign({}, candidate, { special: "" });
       const specialChangedMultiplier = result.picked.some((item) => {
         const withSpecial = engine.buildMultiplier(item.record.move, engineMode(settings.mode), { build: candidate });
@@ -1698,6 +1724,8 @@
   $("#theme-toggle").onclick = () => { state.theme = state.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = state.theme; localStorage.setItem("damage-matrix-theme", state.theme); };
   $("#damage-scaling").value = state.build.scalingMode;
   $("#damage-scaling").onchange = (event) => { state.build.scalingMode = event.target.value; state.sim.result = null; renderMatrix(); renderBuilds(); renderSimulation(); if (state.selected) renderAttack(); };
+  $("#dimension-select").value = state.defense.dimension;
+  $("#dimension-select").onchange = (event) => { state.defense.dimension = event.target.value; state.sim.result = null; renderMatrix(); renderBuilds(); renderSimulation(); if (state.selected) renderAttack(); };
   $("#include-dot-effects").checked = state.dot.enabled;
   $("#include-dot-effects").onchange = (event) => { state.dot.enabled = event.target.checked; state.sim.result = null; renderMatrix(); renderBuilds(); renderSimulation(); if (state.selected) renderAttack(); };
   $("#allow-custom-moves").checked = state.matrix.includeCustoms;

@@ -129,13 +129,24 @@
     });
   }
 
-  function applyTitleBoost(multiplier, title, move, mode) {
+  function applyTitleBoost(multiplier, title, move, mode, toggles) {
     const effects = title && title.effects || {};
     Object.entries(effects).forEach(([key, value]) => {
-      if (key === "BossDamage" && mode === "boss") applyFactor(multiplier, value);
-      else if (key === `${move.statType}Damage`) applyFactor(multiplier, value);
-      else if (move.specialType && key === `${canonicalSpecialKind(move.specialType)}Damage`) applyFactor(multiplier, value);
+      if (bareDamageKeyMatches(key, move, mode, toggles)) applyFactor(multiplier, value);
     });
+  }
+
+  // Shared by title effects and the champion/accessory bare-key reader: `BossDamage` (boss mode
+  // only), `Dimension${toggles.dimension}Damage` (the user-selected Dimension 1-6, since Dimension2
+  // is a physical in-game location this calculator has no other way to detect — the default
+  // "Always on" selection assumes any Dimension-specific bonus is active regardless of number),
+  // `${statType}Damage`, and `${specialKind}Damage`.
+  function bareDamageKeyMatches(key, move, mode, toggles) {
+    if (key === "BossDamage") return mode === "boss";
+    if (/^Dimension\dDamage$/.test(key)) return !toggles || !toggles.dimension || key === `Dimension${toggles.dimension}Damage`;
+    if (key === `${move.statType}Damage`) return true;
+    if (move.specialType && key === `${canonicalSpecialKind(move.specialType)}Damage`) return true;
+    return false;
   }
 
   function applyTransformationBoost(multiplier, transformation, move) {
@@ -148,6 +159,18 @@
   // hand-written cases above, so one generic reader can apply all of them instead of one branch per champion.
   function applyGenericDamageBoosts(multiplier, boosts, move, mode, build, toggles) {
     if (!boosts) return;
+    // Bare `${statType}Damage`/`${specialKind}Damage` keys at the Boosts root (e.g. Kanro's
+    // `StandDamage`) follow the same shape titles use via applyTitleBoost; BossDamage/PvpDamage are
+    // excluded since they're already applied explicitly by their own callers.
+    Object.entries(boosts).forEach(([key, value]) => {
+      if (typeof value !== "number" || key === "BossDamage" || key === "PvpDamage") return;
+      if (bareDamageKeyMatches(key, move, mode, toggles)) applyFactor(multiplier, 1 + value);
+    });
+    const synergy = boosts.AccessorySynergy;
+    if (synergy && typeof synergy.damageBoost === "number") {
+      const equippedAccessories = Array.isArray(build.accessories) ? build.accessories : [build.accessory];
+      if (equippedAccessories.includes(synergy.accessoryId) && (!synergy.damageType || boostMatches(synergy.damageType, move))) applyFactor(multiplier, 1 + synergy.damageBoost);
+    }
     if (boosts.MobDamage && mode !== "duel") addDamageBoost(multiplier, boosts.MobDamage, move);
     if (boosts.DamageProc) {
       const proc = boosts.DamageProc;
@@ -164,8 +187,15 @@
     (Array.isArray(boosts.TransformationBoosts) ? boosts.TransformationBoosts : []).forEach((entry) => {
       const transformation = build.transformation && data.transformations && data.transformations[build.transformation];
       if (!transformationBoostMatches(entry, transformation, build)) return;
-      const universal = toggles.daytime && typeof entry.nightUniversalDamageMultiplier === "number" ? entry.nightUniversalDamageMultiplier : entry.universalDamageMultiplier;
+      // `existingDamageMultiplier` is an alias some entries use instead of `universalDamageMultiplier`
+      // (e.g. SSJ4Goku's Saiyan-line entry) — same effect, just authored under a different name.
+      const universal = toggles.daytime && typeof entry.nightUniversalDamageMultiplier === "number" ? entry.nightUniversalDamageMultiplier
+        : typeof entry.universalDamageMultiplier === "number" ? entry.universalDamageMultiplier
+        : entry.existingDamageMultiplier;
       if (typeof universal === "number") applyFactor(multiplier, universal);
+      // Best case: assume max stacks already built up, consistent with every other stacking family.
+      const stacking = entry.stacking || {};
+      if (typeof stacking.damageBoostPerStack === "number") applyFactor(multiplier, 1 + number(stacking.maxStacks, 0) * stacking.damageBoostPerStack);
     });
     if (boosts.DaytimeBoost && toggles.daytime && boosts.DaytimeBoost.damageTypes && typeof boosts.DaytimeBoost.damageBoost === "number") {
       Object.keys(boosts.DaytimeBoost.damageTypes).forEach((key) => { if (boostMatches(key, move)) applyFactor(multiplier, 1 + boosts.DaytimeBoost.damageBoost); });
@@ -183,6 +213,11 @@
   function applyBestCaseCombatBoosts(multiplier, boosts, move, mode, build, toggles) {
     if (boosts.CombatDamageBoost && typeof boosts.CombatDamageBoost.boost === "number") applyFactor(multiplier, 1 + boosts.CombatDamageBoost.boost);
     if (boosts.CombatEntryBuff && boosts.CombatEntryBuff.damage) addDamageBoost(multiplier, boosts.CombatEntryBuff.damage, move);
+    // Best case: assume the periodic Control-of-the-Beast-style window is active for its per-move bonuses.
+    if (boosts.CombatBuff && boosts.CombatBuff.damageBoostByPower && (!boosts.CombatBuff.transformationId || boosts.CombatBuff.transformationId === build.transformation)) {
+      const boost = boosts.CombatBuff.damageBoostByPower[move.id];
+      if (typeof boost === "number") applyFactor(multiplier, 1 + boost);
+    }
     // Do not apply first-attack damage boosts as a permanent always-on effect; they are conditional by combat timing and should only be counted when
     // the simulator explicitly models that state. Keeping them on globally produces fake permanent stacks like Shadow's 100% strength bonus.
     if (boosts.FirstAttackDamageBoost && false) {
@@ -284,6 +319,7 @@
     BossDamageStackOnHit: "assumes max consecutive-hit stacks are already built up",
     CombatStatGainMultiplier: "assumes max in-combat stacks are already built up",
     CriticalHit: "assumes the in-combat crit-chance ramp and any low-health crit-damage ramp are already maxed",
+    CombatBuff: "assumes its periodic transformed-state damage window is always active",
   };
 
   function collectUnmodeledNotes(name, boosts) {
@@ -311,7 +347,7 @@
 
   function buildMultiplier(move, mode, options) {
     const build = options && options.build || {};
-    const toggles = Object.assign({ inCombat: true, outOfCombat: false, daytime: false, dungeon: false }, options && options.defense);
+    const toggles = Object.assign({ inCombat: true, outOfCombat: false, daytime: false, dungeon: false, dimension: "" }, options && options.defense);
     const multiplier = { value: 1, additive: 0, mode: build.scalingMode || "multiplicative" };
     const champion = build.champion && data.champions && data.champions[build.champion];
     const trait = build.trait && data.traits && data.traits[build.trait];
@@ -328,7 +364,7 @@
     (trait && trait.tiers && trait.tiers[Number(build.traitTier || 0)] && trait.tiers[Number(build.traitTier || 0)].effects || []).forEach((effect) => {
       if (effect.category === "DamageBoost") applyFactor(multiplier, 1 + number(effect.modifier, 0));
     });
-    applyTitleBoost(multiplier, title, move, mode);
+    applyTitleBoost(multiplier, title, move, mode, toggles);
     const accessories = Array.isArray(build.accessories) ? build.accessories : [build.accessory];
     accessories.forEach((id) => {
       const accessory = id && data.accessories && data.accessories[id];
@@ -490,6 +526,8 @@
       (Array.isArray(boosts.TransformationBoosts) ? boosts.TransformationBoosts : []).forEach((entry) => {
         if (!transformationBoostMatches(entry, transformation, build)) return;
         addReduction(`${name} · Transformation defense`, entry.damageReduction);
+        const healthMultiplierValue = toggles.daytime && typeof entry.nightHealthMultiplier === "number" ? entry.nightHealthMultiplier : entry.healthMultiplier;
+        if (typeof healthMultiplierValue === "number") addHealth(`${name} · Transformation health`, healthMultiplierValue);
         const stacking = entry.stacking || {};
         addReduction(`${name} · Transformation stacks`, number(stacking.maxStacks, 0) * number(stacking.damageReductionPerStack, 0), true);
         addHealth(`${name} · Transformation stacks`, number(stacking.maxStacks, 0) * number(stacking.healthBoostPerStack, 0));
